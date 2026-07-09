@@ -2,6 +2,35 @@
 #include <fstream>
 #include "onnx.pb.h" 
 
+void getShape(onnx::ValueInfoProto value_info){
+    std::cout << "Name: " << value_info.name() << " Shape: [";
+    if(value_info.has_type() && value_info.type().has_tensor_type() && value_info.type().tensor_type().has_shape()){
+        const auto& shape = value_info.type().tensor_type().shape();
+        for(int i = 0; i < shape.dim_size(); i++){
+            const auto& dim = shape.dim(i);
+
+            if(dim.has_dim_value()){
+                std::cout << dim.dim_value();
+            }
+            else if(dim.has_dim_param()){
+                std::cout << dim.dim_param();
+            }
+            else{
+                std::cout << '?';
+            }
+
+            if(i < shape.dim_size() - 1) std::cout << ",";
+        }
+        std::cout << "]\n";
+    }
+    else{
+        std::cout << "Unavailable]\n";
+    }
+}for(onnx::ValueInfoProto out : outputs){
+        getShape(out);
+    }
+
+
 int main(int argc, char* argv[]){
     if(argc < 2){
         std::cout << "Use this executable as ./exe_name <path_to_model>\n";
@@ -44,6 +73,43 @@ int main(int argc, char* argv[]){
             std::cout << tensor.dims(j) << (j == tensor.dims_size() - 1 ? "" : ", ");
         }
         std::cout << "]\n\n";
+    }
+
+    const google::protobuf::RepeatedPtrField<onnx::NodeProto> nodes = graph.node();
+    int nodeCount = 0;
+    for(onnx::NodeProto node : nodes){
+        std::cout << node.name() << "\n";
+        nodeCount++;
+    }
+    std::cout << "Total Nodes: " << nodeCount << "\n";
+
+    // try getting shapes of all the tensors in the model;
+
+    const google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> inputs = graph.input();
+    const google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> outputs = graph.output();
+    const google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> inters = graph.value_info();
+
+    
+    std::cout << "--------------------Graph inputs------------------------\n";
+
+    for(onnx::ValueInfoProto in : inputs){
+        getShape(in);
+    }
+
+    std::cout << "--------------------Graph outputs------------------------\n";
+
+    for(onnx::ValueInfoProto out : outputs){
+        getShape(out);
+    }
+
+    std::cout << "--------------------Graph inters------------------------\n";
+    
+    if(graph.value_info_size() == 0){
+        std::cout << "No Intermediate Tensor data available\n";
+    }
+
+    for(onnx::ValueInfoProto inter : inters){
+        getShape(inter);
     }
 
     google::protobuf::ShutdownProtobufLibrary();
