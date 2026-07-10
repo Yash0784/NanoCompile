@@ -45,6 +45,45 @@ Dim operator*(const Dim& left, int64_t right_val) {
 }
 
 // --- Protobuf Attribute Parsing Extraction Utilities ---
+
+// Helper to extract a string attribute (like auto_pad)
+std::string get_node_attr_string(const onnx::NodeProto& node, const std::string& name) {
+    for (const auto& attr : node.attribute()) {
+        if (attr.name() == name && attr.has_s()) {
+            return attr.s();
+        }
+    }
+    return "";
+}
+
+// Helper function to extract integer values from an Initializer Tensor
+std::vector<int64_t> get_initializer_int_values(const onnx::TensorProto& tensor) {
+    std::vector<int64_t> values;
+    
+    // Check raw data first (most common for INT64 initializers)
+    if (tensor.has_raw_data()) {
+        const std::string& raw = tensor.raw_data();
+        size_t count = raw.size() / sizeof(int64_t);
+        const int64_t* data_ptr = reinterpret_cast<const int64_t*>(raw.data());
+        for (size_t i = 0; i < count; ++i) {
+            values.push_back(data_ptr[i]);
+        }
+    } 
+    // Fallback if stored in the explicit int64 repeated field
+    else if (tensor.int64_data_size() > 0) {
+        for (int i = 0; i < tensor.int64_data_size(); ++i) {
+            values.push_back(tensor.int64_data(i));
+        }
+    }
+    // Fallback if stored in standard int32 field
+    else if (tensor.int32_data_size() > 0) {
+        for (int i = 0; i < tensor.int32_data_size(); ++i) {
+            values.push_back(tensor.int32_data(i));
+        }
+    }
+    return values;
+}
+
 int64_t get_node_attr_int(const onnx::NodeProto& node, const std::string& name, int64_t default_val){
     for (const auto& attr : node.attribute()) {
         if (attr.name() == name) return attr.i();
@@ -172,40 +211,56 @@ void infer_gemm(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, st
     outputs[0]->dtype = inputs[0]->dtype; // Gemm preserves input data type
 }
 
-void infer_conv(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs){
-    // Input 0 layout: [Batch_Size, Input_Channels, Height, Width]
-    // Input 1 layout (Weights): [Output_Channels, Input_Channels, Kernel_H, Kernel_W]
-    Dim N = inputs[0]->shape[0];
-    Dim M = inputs[1]->shape[0]; 
+void infer_conv(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs) {
+    if (inputs.size() < 2 || outputs.empty()) return;
 
-    // Extract operational properties governing size scaling
+    const auto& input_shape = inputs[0]->shape;   // [1, 1, 28, 28]
+    const auto& weight_shape = inputs[1]->shape;  // [8, 1, 5, 5]
+
+    if (input_shape.size() < 4 || weight_shape.size() < 4) return;
+
+    size_t num_spatial_axes = input_shape.size() - 2;
+
     std::vector<int64_t> strides = get_node_attr_ints(node, "strides");
-    std::vector<int64_t> pads = get_node_attr_ints(node, "pads");
+    if (strides.empty()) strides.assign(num_spatial_axes, 1);
+
     std::vector<int64_t> dilations = get_node_attr_ints(node, "dilations");
+    if (dilations.empty()) dilations.assign(num_spatial_axes, 1);
 
-    std::vector<Dim> out_shape = { N, M };
-    
-    // Dynamically iterate through variable spatial axes (supporting both 1D, 2D, or 3D Convolutions)
-    for (size_t i = 2; i < inputs[0]->shape.size(); ++i) {
-        auto in_dim = inputs[0]->shape[i];
-        auto k_dim = inputs[1]->shape[i];
+    // Get the auto_pad string ("SAME_UPPER", "SAME_LOWER", "NOTSET", etc.)
+    std::string auto_pad = get_node_attr_string(node, "auto_pad");
 
-        // Perform numerical sampling analysis if the current layout components are static integers
-        if (in_dim.is_static() && k_dim.is_static()) {
-            int64_t stride = (strides.size() > i - 2) ? strides[i - 2] : 1;
-            int64_t pad_low = (pads.size() > (i - 2)) ? pads[i - 2] : 0;
-            int64_t pad_high = (pads.size() > (i - 2) + (inputs[0]->shape.size() - 2)) ? pads[(i - 2) + (inputs[0]->shape.size() - 2)] : 0;
-            int64_t dilation = (dilations.size() > i - 2) ? dilations[i - 2] : 1;
+    std::vector<int64_t> pads = get_node_attr_ints(node, "pads");
+    if (pads.empty()) pads.assign(num_spatial_axes * 2, 0);
 
-            // Mathematical standard Convolution Output Dimension formula
-            int64_t out_dim = ((in_dim.get_static() + pad_low + pad_high - dilation * (k_dim.get_static() - 1) - 1) / stride) + 1;
-            out_shape.push_back(Dim(out_dim));
+    outputs[0]->shape.clear();
+    outputs[0]->shape.push_back(input_shape[0]);  // Batch Size -> 1
+    outputs[0]->shape.push_back(weight_shape[0]); // Out Channels -> 8
+
+    for (size_t i = 0; i < num_spatial_axes; ++i) {
+        if (input_shape[2 + i].is_static() && weight_shape[2 + i].is_static()) {
+            int64_t in_size = input_shape[2 + i].get_static();
+            int64_t stride  = strides[i];
+
+            if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
+                // FIXED: ONNX 'SAME' formula scales output directly by stride via ceiling division
+                int64_t out_size = std::ceil(static_cast<double>(in_size) / stride);
+                outputs[0]->shape.push_back(Dim(out_size));
+            } else {
+                // Fallback to explicit pads calculation if auto_pad is NOTSET or empty
+                int64_t k_size  = weight_shape[2 + i].get_static();
+                int64_t pad_begin = pads[i];
+                int64_t pad_end   = pads[i + num_spatial_axes]; 
+                int64_t dilation  = dilations[i];
+
+                int64_t effective_k = (k_size - 1) * dilation + 1;
+                int64_t out_size = std::floor(static_cast<double>(in_size + pad_begin + pad_end - effective_k) / stride) + 1;
+                outputs[0]->shape.push_back(Dim(out_size));
+            }
         } else {
-            // Generate a labeled dynamic fallback string tracker if dimensions are variable strings
-            out_shape.push_back(Dim(inputs[0]->name + "_conv_spatial"));
+            outputs[0]->shape.push_back(Dim("dynamic_spatial_out"));
         }
     }
-    outputs[0]->shape = out_shape;
     outputs[0]->dtype = inputs[0]->dtype;
 }
 
@@ -240,57 +295,86 @@ void infer_pooling(const onnx::NodeProto& node, const std::vector<tmd*>& inputs,
     outputs[0]->dtype = inputs[0]->dtype;
 }
 
-void infer_reshape(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs){
-    outputs[0]->dtype = inputs[0]->dtype;
-    
-    // Reshape uses input[1] as a 1D tensor tracking the target destination shape description
-    if (inputs.size() > 1 && inputs[1]->data != nullptr) {
-        int64_t* target_shape_data = static_cast<int64_t*>(inputs[1]->data);
-        size_t target_rank = inputs[1]->shape[0].get_static(); 
+void infer_reshape(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs, const google::protobuf::RepeatedPtrField<onnx::TensorProto>& initializers) {
+    if (inputs.size() < 2 || outputs.empty()) return;
 
-        std::vector<Dim> out_shape;
-        int64_t infer_axis = -1;
+    tmd* data_tensor = inputs[0];
+    tmd* shape_tensor = inputs[1];
 
-        for (size_t i = 0; i < target_rank; ++i) {
-            int64_t requested_dim = target_shape_data[i];
-            
-            if (requested_dim == 0) {
-                // ONNX Rule: '0' means copy the dimension size directly from the source tensor
-                out_shape.push_back(inputs[0]->shape[i]); 
-            } else if (requested_dim == -1) {
-                // ONNX Rule: '-1' means automatically compute this axis based on total remaining element math
-                infer_axis = i;
-                out_shape.push_back(Dim("-1_placeholder")); 
+    outputs[0]->dtype = data_tensor->dtype;
+    outputs[0]->shape.clear();
+
+    // 1. Look for the target shape initializer inside the graph's initializers bank
+    bool found_static_shape = false;
+    std::vector<int64_t> target_dims;
+
+    for (const auto& init : initializers) {
+        if (init.name() == shape_tensor->name) {
+            target_dims = get_initializer_int_values(init);
+            found_static_shape = !target_dims.empty();
+            break;
+        }
+    }
+
+    // 2. If we found the static dimensions, handle the ONNX Reshape rules (0 and -1)
+    if (found_static_shape) {
+        int64_t total_elements = 1;
+        bool has_static_input = true;
+        
+        // Compute total elements in input shape to resolve a potential "-1" wildcard
+        for (const auto& d : data_tensor->shape) {
+            if (d.is_static()) {
+                total_elements *= d.get_static();
             } else {
-                // Use the explicit layout target configuration constant specified
-                out_shape.push_back(Dim(requested_dim));
+                has_static_input = false;
             }
         }
 
-        // If a -1 placeholder exists, compute it by checking total source vs destination elements
-        if (infer_axis != -1) {
-            bool total_static = true;
-            int64_t source_elements = 1;
-            for (const auto& d : inputs[0]->shape) {
-                if (d.is_static()) source_elements *= d.get_static(); else total_static = false;
-            }
-            
-            int64_t target_elements = 1;
-            for (size_t i = 0; i < out_shape.size(); ++i) {
-                if (i != static_cast<size_t>(infer_axis) && out_shape[i].is_static()) {
-                    target_elements *= out_shape[i].get_static();
+        int wildcard_index = -1;
+        int64_t target_elements_product = 1;
+
+        for (size_t i = 0; i < target_dims.size(); ++i) {
+            int64_t dim = target_dims[i];
+
+            if (dim == 0) {
+                // ONNX Rule: '0' means copy the dimension from the input tensor at that index
+                if (i < data_tensor->shape.size()) {
+                    outputs[0]->shape.push_back(data_tensor->shape[i]);
+                    if (data_tensor->shape[i].is_static()) {
+                        target_elements_product *= data_tensor->shape[i].get_static();
+                    }
+                } else {
+                    outputs[0]->shape.push_back(Dim("unknown"));
                 }
-            }
-
-            // Successfully overwrite the placeholder if everything parses out statically
-            if (total_static && target_elements > 0) {
-                out_shape[infer_axis] = Dim(source_elements / target_elements);
+            } 
+            else if (dim == -1) {
+                // ONNX Rule: '-1' means infer this dimension based on the remaining elements
+                wildcard_index = static_cast<int>(i);
+                outputs[0]->shape.push_back(Dim(-1)); // Placeholder
+            } 
+            else {
+                outputs[0]->shape.push_back(Dim(dim));
+                target_elements_product *= dim;
             }
         }
-        outputs[0]->shape = out_shape;
+
+        // Resolve the wildcard (-1) dimension if both inputs and targets are static
+        if (wildcard_index != -1 && has_static_input && target_elements_product > 0) {
+            int64_t inferred_dim = total_elements / target_elements_product;
+            outputs[0]->shape[wildcard_index] = Dim(inferred_dim);
+        }
+
+        return;
+    }
+
+    // Fallback: if it's genuinely dynamic, use the shape tensor's size as a fallback rank descriptor
+    if (shape_tensor->shape.size() > 0 && shape_tensor->shape[0].is_static()) {
+        int64_t rank = shape_tensor->shape[0].get_static();
+        for (int64_t i = 0; i < rank; ++i) {
+            outputs[0]->shape.push_back(Dim("dynamic_dim"));
+        }
     } else {
-        // Fallback for purely dynamic graphs where targets change per evaluation slice
-        outputs[0]->shape = { Dim("dynamic_reshape_rank") };
+        outputs[0]->shape.push_back(Dim("dynamic_reshape_rank"));
     }
 }
 

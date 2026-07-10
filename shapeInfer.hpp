@@ -122,7 +122,8 @@ void infer_pooling(const onnx::NodeProto& node,
 // 8. Structural Layout Alteration
 void infer_reshape(const onnx::NodeProto& node, 
                    const std::vector<tmd*>& inputs, 
-                   std::vector<tmd*>& outputs);
+                   std::vector<tmd*>& outputs, 
+                   const google::protobuf::RepeatedPtrField<onnx::TensorProto>& initializers);
 
 // 9. Axis Permutation / Swapping
 void infer_transpose(const onnx::NodeProto& node, 

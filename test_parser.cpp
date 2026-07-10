@@ -256,22 +256,22 @@ int main(int argc, char* argv[]){
             // STEP 4: Route the vectors to your shape inference functions
             std::string op = node.op_type();
             
-            if (op == "Relu") {
+            if (op == "Relu") {//tested
                 infer_relu(node, node_inputs, node_outputs);
             } 
-            else if (op == "Add") {
+            else if (op == "Add") {//tested
                 infer_add(node, node_inputs, node_outputs);
             }
-            else if (op == "MatMul") {
+            else if (op == "MatMul") {//tested
                 infer_matmul(node, node_inputs, node_outputs);
             }
             else if (op == "Gemm") {
                 infer_gemm(node, node_inputs, node_outputs);
             }
-            else if (op == "Conv") {
+            else if (op == "Conv") {//tested
                 infer_conv(node, node_inputs, node_outputs);
             }
-            else if (op == "MaxPool" || op == "AveragePool") {
+            else if (op == "MaxPool" || op == "AveragePool") {//tested
                 infer_pooling(node, node_inputs, node_outputs);
                 
                 // Special secondary output handling for MaxPool tracking indices
@@ -280,8 +280,8 @@ int main(int argc, char* argv[]){
                     node_outputs[1]->dtype = DataType::INT64;       // ONNX specification requires 64-bit integer tracking
                 }
             }
-            else if (op == "Reshape") {
-                infer_reshape(node, node_inputs, node_outputs);
+            else if (op == "Reshape") {//tested
+                infer_reshape(node, node_inputs, node_outputs, graph.initializer());
             }
             else if (op == "Transpose") {
                 infer_transpose(node, node_inputs, node_outputs);
