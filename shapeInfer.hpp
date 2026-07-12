@@ -22,12 +22,13 @@ enum class DataType : uint8_t{
     FLOAT16 = 10
 };
 
-enum class Layout : uint8_t{
-    UNKNOWN = 0,
-    NCHW,    // Channels-first (ONNX Default)
-    NHWC,    // Channels-last (Hardware optimized)
-    CONTIGUOUS_2D, // For standard matrices
-    FLAT_1D        // For biases/vectors
+enum class Layout {
+    NCHW,         // Vision Default (Channels First)
+    NHWC,         // Vision Alternative (Channels Last)
+    ROW_MAJOR,    // Standard Linear Algebra / Matrix 2D representation (C-style)
+    COLUMN_MAJOR, // Contiguous Columns representation
+    FLAT,         // 1D Vectors / Flattened Tensors 
+    UNSPECIFIED   // Fallback layout for non-spatial operations
 };
 
 enum class OpType { ADD, SUB, MUL, DIV };
@@ -55,7 +56,7 @@ typedef struct TensorMetadata{
 
     DataType dtype;
     std::vector<Dim> shape;
-    Layout layout;
+    Layout layout = Layout::UNSPECIFIED;
 
     onnx::NodeProto producer;
     std::vector<onnx::NodeProto> consumers;
@@ -145,5 +146,9 @@ Dim broadcast_dims_optimistic(const Dim& a, const Dim& b);
 // Protobuf extraction helpers
 int64_t get_node_attr_int(const onnx::NodeProto& node, const std::string& name, int64_t default_val);
 std::vector<int64_t> get_node_attr_ints(const onnx::NodeProto& node, const std::string& name);
+
+// Helpers to print.
+const char* data_type_to_string(DataType dtype);
+const char* layout_to_string(Layout layout);
 
 #endif // SHAPEINFER_H

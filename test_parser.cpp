@@ -6,18 +6,6 @@
 #include "shapeInfer.hpp"
 
 
-const char* data_type_to_string(DataType dtype) {
-    switch (dtype) {
-        case DataType::UNKNOWN: return "UNKNOWN";
-        case DataType::FLOAT32: return "FLOAT32";
-        case DataType::UINT8:   return "UINT8";
-        case DataType::INT8:    return "INT8";
-        case DataType::INT32:   return "INT32";
-        case DataType::INT64:   return "INT64";
-        case DataType::FLOAT16: return "FLOAT16";
-        default:                return "UNSUPPORTED_TYPE";
-    }
-}
 
 
 // Helper function to print a symbolic expression recursively
@@ -40,6 +28,7 @@ void print_dim_expression(const Dim& dim) {
         std::cout << ")";
     }
 }
+
 
 
 DataType getDtype(const onnx::ValueInfoProto& value_info) {
@@ -85,6 +74,15 @@ std::vector<Dim> getShape(onnx::ValueInfoProto value_info){
     return ret;
 }
 
+//Guess input Layout, might need changes for a better compiler.
+
+Layout getLayout(tmd* tensor){
+    if(tensor->shape.size() == 4) return Layout::NCHW;
+    else if(tensor->shape.size() == 2) return Layout::ROW_MAJOR;
+    else if(tensor->shape.size() == 1) return Layout::FLAT;
+    else return Layout::UNSPECIFIED;
+}
+
 std::vector<Dim> get_initializer_shape(const onnx::TensorProto& initializer) {
     std::vector<Dim> shape;
     
@@ -125,6 +123,7 @@ void print_tensor_vector_metadata(const std::vector<tmd*>& tensors) {
             }
         }
         std::cout << "]\n";
+        std::cout <<  "  -> Layout: " << layout_to_string(tensor->layout) << "\n";
         std::cout << "-----------------------------------------------------------\n";
     }
 }
@@ -177,6 +176,7 @@ int main(int argc, char* argv[]){
         tens->name = tensor.name();
         tens->dtype = static_cast<DataType>(tensor.data_type());
         tens->shape = get_initializer_shape(tensor);
+        tens->layout = getLayout(tens);
         tens->is_initializer = true;
         tens->is_constant = true;
         
@@ -224,13 +224,14 @@ int main(int argc, char* argv[]){
         tensor->dtype = getDtype(in);
         std::cout << data_type_to_string(tensor->dtype) << " ";
         tensor->shape = getShape(in);
+        tensor->layout = getLayout(tensor);
         tensors.push_back(tensor);
         master_tensor_map[in.name()] = tensor;
     }
 
     std::cout << "--------------------Graph inters------------------------\n";
     
-    if(graph.value_info_size() == 0){
+    if(graph.value_info_size() == 0 || true){
         std::cout << "No Intermediate Tensor data available Infering data\n";
         for (const auto& node : graph.node()){
         
@@ -300,7 +301,7 @@ int main(int argc, char* argv[]){
         }
     }
 
-    for(onnx::ValueInfoProto inter : inters){
+    /*for(onnx::ValueInfoProto inter : inters){
         if(isInit[inter.name()]) continue;
         tmd *tensor = new tmd();
         tensor->name = inter.name();
@@ -309,7 +310,7 @@ int main(int argc, char* argv[]){
         tensor->shape = getShape(inter);
         tensors.push_back(tensor);
         master_tensor_map[inter.name()] = tensor;
-    }
+    }*/
 
     std::cout << "--------------------Graph outputs------------------------\n";
 

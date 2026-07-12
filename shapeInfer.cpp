@@ -27,6 +27,32 @@ int64_t Dim::get_static() const {
     return std::get<int64_t>(expr); 
 }
 
+
+const char* data_type_to_string(DataType dtype) {
+    switch (dtype) {
+        case DataType::UNKNOWN: return "UNKNOWN";
+        case DataType::FLOAT32: return "FLOAT32";
+        case DataType::UINT8:   return "UINT8";
+        case DataType::INT8:    return "INT8";
+        case DataType::INT32:   return "INT32";
+        case DataType::INT64:   return "INT64";
+        case DataType::FLOAT16: return "FLOAT16";
+        default:                return "UNSUPPORTED_TYPE";
+    }
+}
+
+const char* layout_to_string(Layout layout) {
+    switch (layout) {
+        case Layout::NCHW:         return "NCHW";
+        case Layout::NHWC:         return "NHWC";
+        case Layout::ROW_MAJOR:    return "ROW_MAJOR";
+        case Layout::COLUMN_MAJOR: return "COLUMN_MAJOR";
+        case Layout::FLAT:         return "FLAT";
+        case Layout::UNSPECIFIED:  return "UNSPECIFIED";
+        default:                   return "UNSUPPORTED_LAYOUT";
+    }
+}
+
 // --- Operator Overloads to Handle Equations with Objects Natively ---
 
 // Generates a new Addition operation block or collapses constants immediately
@@ -107,6 +133,10 @@ void infer_relu(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, st
     // The dimensions and data properties do not alter at all across the layer boundary.
     outputs[0]->shape = inputs[0]->shape;
     outputs[0]->dtype = inputs[0]->dtype;
+
+    //Infer layout.
+    if (inputs.empty() || outputs.empty()) return;
+    outputs[0]->layout = inputs[0]->layout;
 }
 
 
@@ -142,6 +172,17 @@ void infer_add(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std
     }
     outputs[0]->shape = out_shape;
     outputs[0]->dtype = inputs[0]->dtype;
+
+    //Infer layout.
+    if (inputs.size() < 2 || outputs.empty()) return;
+    
+    // If one side is a structured image and the other is a generic unshaped bias vector,
+    // the output keeps the image's structural layout layout state.
+    if (inputs[0]->layout != Layout::UNSPECIFIED) {
+        outputs[0]->layout = inputs[0]->layout;
+    } else {
+        outputs[0]->layout = inputs[1]->layout;
+    }
 }
 
 
@@ -151,8 +192,23 @@ void infer_matmul(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, 
     
     size_t rA = shape_A.size();
     size_t rB = shape_B.size();
+
+    if(rA == 0 || rB == 0){
+        std::cerr << "[-] Error: rank of an input tensor is zero, infer_matmul returned.\n";
+        return;
+    }
     
     // Matrix Multiplication rule: Input A [..., M, K] x Input B [..., K, N] -> Output [..., M, N]
+    Dim k1 = shape_A[rA - 1];
+    Dim k2 = shape_B[rB - 2];
+
+    if(std::holds_alternative<int64_t>(k1.expr) && std::holds_alternative<int64_t>(k2.expr)){
+        if(k1.get_static() != k2.get_static()){
+            std::cerr << "[-] Error: Incompatable tensor sizes, infer_gemm returned.\n";
+            return;
+        }
+    }
+
     Dim M = (rA > 1) ? shape_A[rA - 2] : Dim(1);
     Dim N = shape_B[rB - 1];
 
@@ -172,12 +228,21 @@ void infer_matmul(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, 
 
     outputs[0]->shape = out_shape;
     outputs[0]->dtype = inputs[0]->dtype;
+
+    //Infer layout.
+    if (inputs.empty() || outputs.empty()) return;
+    
+    if (inputs[0]->shape.size() == 2) {
+        outputs[0]->layout = Layout::ROW_MAJOR;
+    } else {
+        outputs[0]->layout = Layout::UNSPECIFIED;
+    }
 }
 
 void infer_gemm(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs) {
     // 1. Safety check: Gemm must have at least inputs A and B
     if (inputs.size() < 2 || outputs.empty()) {
-        std::cerr << "[-] Error: Gemm requires at least 2 inputs." << std::endl;
+        std::cerr << "[-] Error: Gemm requires at least 2 inputs.\n";
         return;
     }
 
@@ -186,7 +251,7 @@ void infer_gemm(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, st
 
     // 2. Safety check: Ensure A and B actually have dimensions to read
     if (shape_A.size() < 2 || shape_B.size() < 2) {
-        std::cerr << "[-] Error: Gemm inputs A and B must be at least 2D." << std::endl;
+        std::cerr << "[-] Error: Gemm inputs A and B must be 2D.\n";
         return;
     }
 
@@ -196,19 +261,47 @@ void infer_gemm(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, st
 
     // Determine output dimensions safely based on transposition
     // This is likely where your operator[] crashed if shape_A or shape_B were smaller than expected!
+
+    Dim k1 = (transA == 0) ? shape_A[1] : shape_A[0];
+    Dim k2 = (transB == 0) ? shape_B[0] : shape_B[1];
+
+    if(std::holds_alternative<int64_t>(k1.expr) && std::holds_alternative<int64_t>(k2.expr)){
+        if(k1.get_static() != k2.get_static()){
+            std::cerr << "[-] Error: Incompatable tensor sizes, infer_gemm returned.\n";
+            return;
+        }
+    }
+
     Dim M = (transA == 0) ? shape_A[0] : shape_A[1];
     Dim N = (transB == 0) ? shape_B[1] : shape_B[0];
 
     // 3. Handle optional 3rd input C (Bias)
-    if (inputs.size() > 2 && inputs[2] != nullptr) {
+    if (inputs.size() > 2 && inputs[2] != nullptr){
         const auto& shape_C = inputs[2]->shape;
-        // You can add validation logic for shape_C here if needed, 
-        // but crucially, do NOT assume shape_C[0] is safe without checking shape_C.size()!
+        bool flag = true;
+        if(shape_C.size() == 1){
+            if(shape_C[0].get_static() != N.get_static()) flag = false;
+        }
+        else if(shape_C.size() == 2){
+            if(!((shape_C[0].get_static() == M.get_static() || shape_C[0].get_static() == 1) && (shape_C[1].get_static() == N.get_static() || (shape_C[1].get_static() == 1)))) flag = false;
+        }
+        else{
+            flag = false;
+        }
+
+        if(!flag){
+            std::cerr << "[-] Error: Bias shapee mismatch in gemm, infer_gemm returned.\n";
+            return;
+        }
     }
 
     // 4. Assign the inferred shape safely to the output
     outputs[0]->shape = {M, N};
     outputs[0]->dtype = inputs[0]->dtype; // Gemm preserves input data type
+
+    //Infer layout.
+    if (outputs.empty()) return;
+    outputs[0]->layout = Layout::ROW_MAJOR;
 }
 
 void infer_conv(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs) {
@@ -262,6 +355,20 @@ void infer_conv(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, st
         }
     }
     outputs[0]->dtype = inputs[0]->dtype;
+
+    //Infer layout.
+    if (inputs.empty() || outputs.empty()) return;
+    
+    // Check if an attribute explicitly requests a format change, otherwise pull input state
+    std::string data_format = get_node_attr_string(node, "data_format"); 
+    if (data_format == "NHWC") {
+        outputs[0]->layout = Layout::NHWC;
+    } else if (data_format == "NCHW") {
+        outputs[0]->layout = Layout::NCHW;
+    } else {
+        // Safe default: propagate the exact layout configuration of the feature input
+        outputs[0]->layout = inputs[0]->layout;
+    }
 }
 
 void infer_pooling(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs){
@@ -293,6 +400,10 @@ void infer_pooling(const onnx::NodeProto& node, const std::vector<tmd*>& inputs,
     }
     outputs[0]->shape = out_shape;
     outputs[0]->dtype = inputs[0]->dtype;
+
+    //Infer shape.
+    if (inputs.empty() || outputs.empty()) return;
+    outputs[0]->layout = inputs[0]->layout;
 }
 
 void infer_reshape(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs, const google::protobuf::RepeatedPtrField<onnx::TensorProto>& initializers) {
@@ -376,6 +487,18 @@ void infer_reshape(const onnx::NodeProto& node, const std::vector<tmd*>& inputs,
     } else {
         outputs[0]->shape.push_back(Dim("dynamic_reshape_rank"));
     }
+
+    //Infer Layout.
+    if (outputs.empty()) return;
+    
+    size_t out_rank = outputs[0]->shape.size();
+    if (out_rank == 1) {
+        outputs[0]->layout = Layout::FLAT;
+    } else if (out_rank == 2) {
+        outputs[0]->layout = Layout::ROW_MAJOR;
+    } else {
+        outputs[0]->layout = Layout::UNSPECIFIED; // Destroys semantic NCHW context
+    }
 }
 
 void infer_transpose(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs) {
@@ -396,6 +519,19 @@ void infer_transpose(const onnx::NodeProto& node, const std::vector<tmd*>& input
     }
     outputs[0]->shape = out_shape;
     outputs[0]->dtype = inputs[0]->dtype;
+
+    //Infer layout.
+    if (inputs.empty() || outputs.empty()) return;
+    
+    // If we have an NCHW layout and permute axes to [0, 2, 3, 1] -> it becomes NHWC
+    if (inputs[0]->layout == Layout::NCHW && perm == std::vector<int64_t>{0, 2, 3, 1}) {
+        outputs[0]->layout = Layout::NHWC;
+    } else if (inputs[0]->layout == Layout::NHWC && perm == std::vector<int64_t>{0, 3, 1, 2}) {
+        outputs[0]->layout = Layout::NCHW;
+    } else {
+        outputs[0]->layout = Layout::UNSPECIFIED; 
+    }
+    
 }
 
 void infer_concat(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs){
@@ -417,6 +553,22 @@ void infer_concat(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, 
     out_shape[axis] = concat_axis_expr;
     outputs[0]->shape = out_shape;
     outputs[0]->dtype = inputs[0]->dtype;
+
+    //Infer Layout.
+    if (inputs.empty() || outputs.empty()) return;
+
+    Layout baseline_layout = inputs[0]->layout;
+
+    //Validate that all other tensors joining the party match the baseline
+    for (size_t i = 1; i < inputs.size(); ++i) {
+        if (inputs[i]->layout != baseline_layout) {
+            std::cerr << "[-] Layout Mismatch Error: Concat inputs must have identical layouts!" << std::endl;
+            outputs[0]->layout = Layout::UNSPECIFIED;
+            return;
+        }
+    }
+
+    outputs[0]->layout = baseline_layout;
 }
 
 
