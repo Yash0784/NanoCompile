@@ -231,7 +231,7 @@ int main(int argc, char* argv[]){
 
     std::cout << "--------------------Graph inters------------------------\n";
     
-    if(graph.value_info_size() == 0 || true){
+    if(graph.value_info_size() == 0){
         std::cout << "No Intermediate Tensor data available Infering data\n";
         for (const auto& node : graph.node()){
         
@@ -301,7 +301,7 @@ int main(int argc, char* argv[]){
         }
     }
 
-    /*for(onnx::ValueInfoProto inter : inters){
+    for(onnx::ValueInfoProto inter : inters){
         if(isInit[inter.name()]) continue;
         tmd *tensor = new tmd();
         tensor->name = inter.name();
@@ -310,7 +310,7 @@ int main(int argc, char* argv[]){
         tensor->shape = getShape(inter);
         tensors.push_back(tensor);
         master_tensor_map[inter.name()] = tensor;
-    }*/
+    }
 
     std::cout << "--------------------Graph outputs------------------------\n";
 
