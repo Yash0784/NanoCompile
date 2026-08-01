@@ -571,4 +571,45 @@ void infer_concat(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, 
     outputs[0]->layout = baseline_layout;
 }
 
-
+void infershape_driver(const onnx::NodeProto& node, std::string op, const google::protobuf::RepeatedPtrField<onnx::TensorProto>& initializers, std::vector<tmd*>& node_inputs, std::vector<tmd*>& node_outputs){
+    if (op == "Relu") {//tested
+        infer_relu(node, node_inputs, node_outputs);
+    }
+    else if (op == "Add") {//tested
+        infer_add(node, node_inputs, node_outputs);
+    }
+    else if (op == "MatMul") {//tested
+        infer_matmul(node, node_inputs, node_outputs);
+    }
+    else if (op == "Gemm") {
+        infer_gemm(node, node_inputs, node_outputs);
+    }
+    else if (op == "Conv") {//tested
+        infer_conv(node, node_inputs, node_outputs);
+    }
+    else if (op == "MaxPool" || op == "AveragePool") {//tested
+        infer_pooling(node, node_inputs, node_outputs);
+                
+        // Special secondary output handling for MaxPool tracking indices
+        if (op == "MaxPool" && node_outputs.size() > 1) {
+            node_outputs[1]->shape = node_outputs[0]->shape; // Indices share identical output dimensions
+            node_outputs[1]->dtype = DataType::INT64;       // ONNX specification requires 64-bit integer tracking
+        }
+    }
+    else if (op == "Reshape") {//tested
+        infer_reshape(node, node_inputs, node_outputs, initializers);
+    }
+    else if (op == "Transpose") {
+        infer_transpose(node, node_inputs, node_outputs);
+    }
+    else if (op == "Concat") {
+        infer_concat(node, node_inputs, node_outputs);
+    }
+    else {
+        // Safety handler to capture un-implemented layers instantly during graph parsing
+        std::cerr << "[-] Error: Unsupported ONNX operator '" << op 
+                << "' encountered on node '" << node.name() << "'." << "\n";
+        // You can choose to throw an exception here depending on your runtime architecture requirements:
+        // throw std::runtime_error("Unsupported operator: " + op);
+    }
+}

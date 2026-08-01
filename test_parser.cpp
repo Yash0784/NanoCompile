@@ -4,28 +4,50 @@
 #include <fstream>
 #include "onnx.pb.h" 
 #include "shapeInfer.hpp"
+//#include "graph.hpp"
+
+
+
+class ONNXGraph {
+public:
+    // Model Metadata
+    int64_t ir_version = 0;
+    int64_t model_version = 0;
+    std::string producer_name = "Unknown";
+    std::string producer_version = "Unknown";
+    std::string domain = "";
+
+    // Nodes and edges
+    std::unordered_map<std::string, bool> isInit;
+    std::unordered_map<std::string, tmd*> master_tensor_map;
+    std::vector<tmd*> tensors;
+    std::vector<onnx::NodeProto> nodes;
+    void build_graph(const onnx::ModelProto& model);
+    //void print_metadata(std::ostream& os) const;
+};
 
 
 
 
 // Helper function to print a symbolic expression recursively
-void print_dim_expression(const Dim& dim) {
+void print_dim_expression(const Dim& dim, std::ostream& os = std::cout) {
     if (std::holds_alternative<int64_t>(dim.expr)) {
-        std::cout << std::get<int64_t>(dim.expr);
+        os << std::get<int64_t>(dim.expr);
     } else if (std::holds_alternative<std::string>(dim.expr)) {
-        std::cout << std::get<std::string>(dim.expr);
+        os << std::get<std::string>(dim.expr);
     } else {
         const auto& bin = std::get<Dim::BinaryOp>(dim.expr);
-        std::cout << "(";
-        print_dim_expression(*(bin.left));
+        os << "(";
+        // Pass 'os' recursively so nested expressions write to the same stream
+        print_dim_expression(*(bin.left), os);
         switch (bin.op) {
-            case OpType::ADD: std::cout << " + "; break;
-            case OpType::SUB: std::cout << " - "; break;
-            case OpType::MUL: std::cout << " * "; break;
-            case OpType::DIV: std::cout << " / "; break;
+            case OpType::ADD: os << " + "; break;
+            case OpType::SUB: os << " - "; break;
+            case OpType::MUL: os << " * "; break;
+            case OpType::DIV: os << " / "; break;
         }
-        print_dim_expression(*(bin.right));
-        std::cout << ")";
+        print_dim_expression(*(bin.right), os);
+        os << ")";
     }
 }
 
@@ -97,35 +119,200 @@ std::vector<Dim> get_initializer_shape(const onnx::TensorProto& initializer) {
 }
 
 
-void print_tensor_vector_metadata(const std::vector<tmd*>& tensors) {
-    std::cout << "\n================= TENSOR METADATA SUMMARY =================\n";
+void print_tensor_vector_metadata(const std::vector<tmd*>& tensors, std::ostream& os = std::cout) {
+    os << "\n================= TENSOR METADATA SUMMARY =================\n";
     
     for (size_t i = 0; i < tensors.size(); ++i) {
         const tmd* tensor = tensors[i];
         if (!tensor) continue;
 
         // 1. Print Name (Appends " [INIT]" if the boolean flag is true)
-        std::cout << "Tensor [" << i << "]: " << tensor->name;
+        os << "Tensor [" << i << "]: " << tensor->name;
         if (tensor->is_initializer) {
-            std::cout << " [INIT]";
+            os << " [INIT]";
         }
-        std::cout << "\n";
+        os << "\n";
 
         // 2. Print Data Type
-        std::cout << "  -> Type:  " << data_type_to_string(tensor->dtype) << "\n";
+        os << "  -> Type:      " << data_type_to_string(tensor->dtype) << "\n";
         
         // 3. Format and print the shape tracking vector
-        std::cout << "  -> Shape: [";
+        os << "  -> Shape:     [";
         for (size_t j = 0; j < tensor->shape.size(); ++j) {
-            print_dim_expression(tensor->shape[j]);
+            print_dim_expression(tensor->shape[j], os);
             if (j < tensor->shape.size() - 1) {
-                std::cout << ", ";
+                os << ", ";
             }
         }
-        std::cout << "]\n";
-        std::cout <<  "  -> Layout: " << layout_to_string(tensor->layout) << "\n";
-        std::cout << "-----------------------------------------------------------\n";
+        os << "]\n";
+        os << "  -> Layout:    " << layout_to_string(tensor->layout) << "\n";
+
+        // 4. Print Producer Node
+        os << "  -> Producer:  ";
+        if (tensor->producer != nullptr) {
+            // Display node name if set, otherwise fallback to its op_type
+            std::string prod_name = tensor->producer->name().empty() 
+                ? ("Node(" + tensor->producer->op_type() + ")") 
+                : tensor->producer->name();
+            os << prod_name << " [" << tensor->producer->op_type() << "]\n";
+        } else {
+            // Tensors with no producer are graph inputs or static weight initializers
+            os << (tensor->is_initializer ? "None [WEIGHT_INITIALIZER]" : "None [GRAPH_INPUT]") << "\n";
+        }
+
+        // 5. Print Consumer Nodes
+        os << "  -> Consumers: ";
+        if (tensor->consumers.empty()) {
+            os << "None [GRAPH_OUTPUT]\n";
+        } else {
+            os << "[";
+            for (size_t k = 0; k < tensor->consumers.size(); ++k) {
+                const auto* consumer = tensor->consumers[k];
+                if (!consumer) continue;
+
+                std::string cons_name = consumer->name().empty() 
+                    ? ("Node(" + consumer->op_type() + ")") 
+                    : consumer->name();
+
+                os << cons_name << " [" << consumer->op_type() << "]";
+                if (k < tensor->consumers.size() - 1) {
+                    os << ", ";
+                }
+            }
+            os << "]\n";
+        }
+
+        os << "-----------------------------------------------------------\n";
     }
+}
+
+void tensor_uninfered(tmd *tensor, onnx::ValueInfoProto tens, bool isInput, std::unordered_map<std::string, tmd*>& master_tensor_map, std::vector<tmd*>& tensors){
+    tensor->name = tens.name();
+    tensor->dtype = getDtype(tens);
+    std::cout << data_type_to_string(tensor->dtype) << " ";
+    tensor->shape = getShape(tens);
+    if(isInput) tensor->layout = getLayout(tensor);
+    tensors.push_back(tensor);
+    master_tensor_map[tens.name()] = tensor;
+}
+
+void link_tensor_producers_and_consumers(const std::vector<onnx::NodeProto>& topo_nodes,std::unordered_map<std::string, tmd*>& master_tensor_map) 
+{
+    // Traverse through topologically sorted nodes
+    for (const auto& node : topo_nodes) {
+
+        // 1. PROCESS INPUTS -> Record this node as a CONSUMER of input tensors
+        for (const auto& input_name : node.input()) {
+            // ONNX allows empty strings for optional inputs (e.g., missing Conv bias)
+            if (input_name.empty()) continue;
+
+            auto it = master_tensor_map.find(input_name);
+            if (it != master_tensor_map.end() && it->second != nullptr) {
+                tmd* input_tensor = it->second;
+                
+                // Add current node pointer to this tensor's consumer list
+                input_tensor->consumers.push_back(&node);
+            }
+        }
+
+        // 2. PROCESS OUTPUTS -> Record this node as the PRODUCER of output tensors
+        for (const auto& output_name : node.output()) {
+            if (output_name.empty()) continue;
+
+            auto it = master_tensor_map.find(output_name);
+            if (it != master_tensor_map.end() && it->second != nullptr) {
+                tmd* output_tensor = it->second;
+                
+                // Link current node pointer as the producer of this tensor
+                output_tensor->producer = &node;
+            }
+        }
+    }
+}
+
+void ONNXGraph::build_graph(const onnx::ModelProto& model){
+    // Extract Global Metadata
+    this->ir_version = model.ir_version();
+    this->model_version = model.model_version();
+    this->producer_name = model.producer_name();
+    this->producer_version = model.producer_version();
+    this->domain = model.domain();
+    const onnx::GraphProto& graph = model.graph();
+
+    for(int i = 0; i < graph.initializer_size(); ++i){
+        // Access each individual tensor weight
+        const onnx::TensorProto& tensor = graph.initializer(i);
+
+        tmd* tens = new tmd;
+
+        tens->name = tensor.name();
+        tens->dtype = static_cast<DataType>(tensor.data_type());
+        tens->shape = get_initializer_shape(tensor);
+        tens->layout = getLayout(tens);
+        tens->is_initializer = true;
+        tens->is_constant = true;
+
+        isInit[tensor.name()] = true;
+        tensors.push_back(tens);
+        master_tensor_map[tensor.name()] = tens;
+    }
+
+    nodes.clear();
+    nodes.reserve(graph.node_size());
+
+    for (const auto& node : graph.node()) {
+        nodes.push_back(node);
+    }
+
+    const google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> inputs = graph.input();
+    const google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> outputs = graph.output();
+    const google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> inters = graph.value_info();
+
+    for(onnx::ValueInfoProto in : inputs){
+        tmd *tensor = new tmd();
+        tensor_uninfered(tensor, in, true, master_tensor_map, tensors);
+    }
+
+    for(onnx::ValueInfoProto out : outputs){
+        tmd *tensor = new tmd();
+        tensor_uninfered(tensor, out, false, master_tensor_map, tensors);
+    }
+
+    for(onnx::ValueInfoProto inter : inters){
+        if(isInit[inter.name()]) continue;
+        tmd *tensor = new tmd();
+        tensor_uninfered(tensor, inter, false, master_tensor_map, tensors);
+    }
+
+    if(graph.value_info_size() == 0){
+        std::cout << "No Intermediate Tensor data available Infering data\n";
+        for (const auto& node : nodes){
+        
+            // Gather existing input pointers
+            std::vector<tmd*> node_inputs;
+            for (const auto& in_name : node.input()) {
+                node_inputs.push_back(master_tensor_map[in_name]);
+            }
+
+            // Pre-allocate empty destination outputs based on node description
+            std::vector<tmd*> node_outputs;
+            for (const auto& out_name : node.output()) {
+                tmd* new_output = new tmd();
+                new_output->name = out_name;
+                new_output->shape_inferred = true;
+                
+                // Map it immediately so subsequent nodes down the pipeline can reference it
+                tensors.push_back(new_output);
+                master_tensor_map[out_name] = new_output;
+                node_outputs.push_back(new_output);
+            }
+
+            // Route the vectors to shape inference functions
+            infershape_driver(node, node.op_type(), graph.initializer(), node_inputs, node_outputs);
+        
+        }
+    }
+    link_tensor_producers_and_consumers(nodes, master_tensor_map);
 }
 
 int main(int argc, char* argv[]){
@@ -150,184 +337,20 @@ int main(int argc, char* argv[]){
         return 1;
     }
 
-    std::cout << "ONNX IR Version: " << model.ir_version() << "\n";
-    std::cout << "Model Version: " << model.model_version() << "\n";
-    std::cout << "Producer Name: " << model.producer_name() << "\n";
-    std::cout << "Producer Version: "<< model.producer_version() << "\n";
-
     //reference to the Graph
-    const onnx::GraphProto& graph = model.graph();
-
-    //looping through the initializers using the _size() syntax
-    std::cout << "\nTotal Initializers: " << graph.initializer_size() << "\n\n";
-
-    std::unordered_map<std::string, bool> isInit;
-    std::unordered_map<std::string, tmd*> master_tensor_map;
-    std::vector<tmd*> tensors;
+    ONNXGraph graph;
     
-    for(int i = 0; i < graph.initializer_size(); ++i){
-        // Access each individual tensor weight
+    graph.build_graph(model);
 
-        
-        const onnx::TensorProto& tensor = graph.initializer(i);
-
-        tmd* tens = new tmd;
-
-        tens->name = tensor.name();
-        tens->dtype = static_cast<DataType>(tensor.data_type());
-        tens->shape = get_initializer_shape(tensor);
-        tens->layout = getLayout(tens);
-        tens->is_initializer = true;
-        tens->is_constant = true;
-        
-        isInit[tensor.name()] = true;
-        tensors.push_back(tens);
-        master_tensor_map[tensor.name()] = tens;
-        
-        std::cout << "Initializer [" << i << "] Name: " << tensor.name() << "\n";
-        std::cout << "  Dimensions: [";
-        for (int j = 0; j < tensor.dims_size(); ++j) {
-            std::cout << tensor.dims(j) << (j == tensor.dims_size() - 1 ? "" : ", ");
-        }
-        std::cout << "]\n\n";
+    std::ofstream outfile("tensor_summary.txt");
+    if (outfile.is_open()) {
+        print_tensor_vector_metadata(graph.tensors, outfile);
+        outfile.close(); // <-- ADD THIS: Ensures memory buffer flushes completely to disk!
+        std::cout << "Successfully saved tensor summary to tensor_summary.txt\n";
     }
-
-    const google::protobuf::RepeatedPtrField<onnx::NodeProto> nodes = graph.node();
-    int nodeCount = 0;
-    for(onnx::NodeProto node : nodes){
-        std::cout << node.name() << " Inputs: ";
-        for(auto& inName: node.input()){
-            std::cout << inName << " ";
-        }
-        std::cout << " Outputs: ";
-        for(auto& outName: node.output()){
-            std::cout << outName << " ";
-        }
-        std::cout << "\n";
-        nodeCount++;
+    else {
+        std::cerr << "Error: Could not open output file for writing.\n";
     }
-    std::cout << "Total Nodes: " << nodeCount << "\n";
-
-    // try getting shapes of all the tensors in the model;
-
-    const google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> inputs = graph.input();
-    const google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> outputs = graph.output();
-    const google::protobuf::RepeatedPtrField<onnx::ValueInfoProto> inters = graph.value_info();
-
-
-    
-    std::cout << "--------------------Graph inputs------------------------\n";
-
-    for(onnx::ValueInfoProto in : inputs){
-        tmd *tensor = new tmd();
-        tensor->name = in.name();
-        tensor->dtype = getDtype(in);
-        std::cout << data_type_to_string(tensor->dtype) << " ";
-        tensor->shape = getShape(in);
-        tensor->layout = getLayout(tensor);
-        tensors.push_back(tensor);
-        master_tensor_map[in.name()] = tensor;
-    }
-
-    std::cout << "--------------------Graph inters------------------------\n";
-    
-    if(graph.value_info_size() == 0){
-        std::cout << "No Intermediate Tensor data available Infering data\n";
-        for (const auto& node : graph.node()){
-        
-            // Gather existing input pointers
-            std::vector<tmd*> node_inputs;
-            for (const auto& in_name : node.input()) {
-                node_inputs.push_back(master_tensor_map[in_name]);
-            }
-
-            // Pre-allocate empty destination outputs based on node description
-            std::vector<tmd*> node_outputs;
-            for (const auto& out_name : node.output()) {
-                tmd* new_output = new tmd();
-                new_output->name = out_name;
-                new_output->shape_inferred = true;
-                
-                // Map it immediately so subsequent nodes down the pipeline can reference it
-                tensors.push_back(new_output);
-                master_tensor_map[out_name] = new_output;
-                node_outputs.push_back(new_output);
-            }
-
-            // STEP 4: Route the vectors to your shape inference functions
-            std::string op = node.op_type();
-            
-            if (op == "Relu") {//tested
-                infer_relu(node, node_inputs, node_outputs);
-            } 
-            else if (op == "Add") {//tested
-                infer_add(node, node_inputs, node_outputs);
-            }
-            else if (op == "MatMul") {//tested
-                infer_matmul(node, node_inputs, node_outputs);
-            }
-            else if (op == "Gemm") {
-                infer_gemm(node, node_inputs, node_outputs);
-            }
-            else if (op == "Conv") {//tested
-                infer_conv(node, node_inputs, node_outputs);
-            }
-            else if (op == "MaxPool" || op == "AveragePool") {//tested
-                infer_pooling(node, node_inputs, node_outputs);
-                
-                // Special secondary output handling for MaxPool tracking indices
-                if (op == "MaxPool" && node_outputs.size() > 1) {
-                    node_outputs[1]->shape = node_outputs[0]->shape; // Indices share identical output dimensions
-                    node_outputs[1]->dtype = DataType::INT64;       // ONNX specification requires 64-bit integer tracking
-                }
-            }
-            else if (op == "Reshape") {//tested
-                infer_reshape(node, node_inputs, node_outputs, graph.initializer());
-            }
-            else if (op == "Transpose") {
-                infer_transpose(node, node_inputs, node_outputs);
-            }
-            else if (op == "Concat") {
-                infer_concat(node, node_inputs, node_outputs);
-            }
-            else {
-                // Safety handler to capture un-implemented layers instantly during graph parsing
-                std::cerr << "[-] Error: Unsupported ONNX operator '" << op 
-                        << "' encountered on node '" << node.name() << "'." << std::endl;
-                // You can choose to throw an exception here depending on your runtime architecture requirements:
-                // throw std::runtime_error("Unsupported operator: " + op);
-            }
-        
-        }
-    }
-
-    for(onnx::ValueInfoProto inter : inters){
-        if(isInit[inter.name()]) continue;
-        tmd *tensor = new tmd();
-        tensor->name = inter.name();
-        tensor->dtype = getDtype(inter);
-        std::cout << data_type_to_string(tensor->dtype) << " ";
-        tensor->shape = getShape(inter);
-        tensors.push_back(tensor);
-        master_tensor_map[inter.name()] = tensor;
-    }
-
-    std::cout << "--------------------Graph outputs------------------------\n";
-
-    for(onnx::ValueInfoProto out : outputs){
-        tmd *tensor = new tmd();
-        tensor->name = out.name();
-        tensor->dtype = getDtype(out);
-        std::cout << data_type_to_string(tensor->dtype) << " ";
-        tensor->shape = getShape(out);
-        tensors.push_back(tensor);
-        master_tensor_map[out.name()] = tensor;
-    }
-
-    std::cout << "Total Tensors: " << tensors.size() << "\n";
-
-    print_tensor_vector_metadata(tensors);
-
 
     google::protobuf::ShutdownProtobufLibrary();
     return 0;

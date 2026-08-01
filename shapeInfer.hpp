@@ -58,8 +58,8 @@ typedef struct TensorMetadata{
     std::vector<Dim> shape;
     Layout layout = Layout::UNSPECIFIED;
 
-    onnx::NodeProto producer;
-    std::vector<onnx::NodeProto> consumers;
+    const onnx::NodeProto* producer = nullptr;
+    std::vector<const onnx::NodeProto*> consumers;
 
     bool is_initializer = false;
     bool is_constant = false;
@@ -150,5 +150,6 @@ std::vector<int64_t> get_node_attr_ints(const onnx::NodeProto& node, const std::
 // Helpers to print.
 const char* data_type_to_string(DataType dtype);
 const char* layout_to_string(Layout layout);
+void infershape_driver(const onnx::NodeProto& node, std::string op, const google::protobuf::RepeatedPtrField<onnx::TensorProto>& initializers, std::vector<tmd*>& node_inputs, std::vector<tmd*>& node_outputs);
 
 #endif // SHAPEINFER_H
