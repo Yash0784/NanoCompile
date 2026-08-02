@@ -19,4 +19,7 @@ if(UNIX AND NOT APPLE)
     target_link_libraries(onnx_proto PUBLIC absl_log_internal_check_op absl_log_internal_message)
 endif()
 
-target_link_libraries(onnx_parser PRIVATE shape_infer)
+add_library(graph SHARED graph.cpp)
+target_link_libraries(graph PUBLIC shape_infer)
+
+target_link_libraries(onnx_parser PRIVATE graph)
