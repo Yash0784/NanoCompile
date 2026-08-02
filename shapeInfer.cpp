@@ -128,6 +128,39 @@ std::vector<int64_t> get_node_attr_ints(const onnx::NodeProto& node, const std::
     return vals;
 }
 
+void life_time_tens(const std::vector<onnx::NodeProto>& TopoNodes, std::unordered_map<std::string, tmd*>& master_tensor_map){
+    
+    //written assuming all the in names and out names are in the master tensor map;
+    
+    int i = 0;
+    for(auto node : TopoNodes){
+
+        for(auto in_name : node.input()){
+            if(in_name.empty()) continue;
+
+            tmd *meta = master_tensor_map[in_name];
+
+            if(meta->first_use == -1){
+                meta->first_use = meta->last_use = i;
+                continue;
+            }
+
+            meta->last_use = i;
+
+        }
+
+        for(auto out_name : node.output()){
+            if(out_name.empty()) continue;
+
+            master_tensor_map[out_name]->born_at = i;
+        }
+
+        i++;
+    }
+}
+
+
+
 void infer_relu(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs){
     // Activation functions are completely element-wise.
     // The dimensions and data properties do not alter at all across the layer boundary.

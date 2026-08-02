@@ -72,12 +72,16 @@ typedef struct TensorMetadata{
     int buffer_id = -1;
     size_t offset = 0;
 
+    int born_at = -1;
     int first_use = -1;
     int last_use = -1;
 
     bool shape_inferred = false;
     bool optimized = false;
 }tmd;
+
+
+void life_time_tens(const std::vector<onnx::NodeProto>& TopoNodes, std::unordered_map<std::string, tmd*>& master_tensor_map);
 
 // ============================================================================
 // 2. Algebraic Operator Overloads

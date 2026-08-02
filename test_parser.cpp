@@ -182,6 +182,8 @@ void print_tensor_vector_metadata(const std::vector<tmd*>& tensors, std::ostream
             os << "]\n";
         }
 
+        os << "  -> Born_at: " << tensor->born_at << "  First_use: " << tensor->first_use << "  Last_use: " << tensor->last_use << "\n";
+
         os << "-----------------------------------------------------------\n";
     }
 }
@@ -313,6 +315,9 @@ void ONNXGraph::build_graph(const onnx::ModelProto& model){
         }
     }
     link_tensor_producers_and_consumers(nodes, master_tensor_map);
+
+    life_time_tens(nodes, master_tensor_map);
+
 }
 
 int main(int argc, char* argv[]){
