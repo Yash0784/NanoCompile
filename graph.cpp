@@ -3,27 +3,8 @@
 #include <variant>
 #include <fstream>
 #include "onnx.pb.h" 
+#include "graph.hpp"
 #include "shapeInfer.hpp"
-
-class ONNXGraph {
-public:
-    // Model Metadata
-    int64_t ir_version = 0;
-    int64_t model_version = 0;
-    std::string producer_name = "Unknown";
-    std::string producer_version = "Unknown";
-    std::string domain = "";
-
-    // Nodes and edges
-    std::unordered_map<std::string, bool> isInit;
-    std::unordered_map<std::string, tmd*> master_tensor_map;
-    std::vector<tmd*> tensors;
-    std::vector<onnx::NodeProto> nodes;
-    void build_graph(const onnx::ModelProto& model);
-    //void print_metadata(std::ostream& os) const;
-};
-
-
 
 
 // Helper function to print a symbolic expression recursively

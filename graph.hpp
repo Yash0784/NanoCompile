@@ -37,7 +37,7 @@ public:
 // ============================================================================
 
 // Recursive symbolic dimension printer
-void print_dim_expression(const Dim& dim, std::ostream& os = std::cout);
+void print_dim_expression(const Dim& dim, std::ostream& os);
 
 // Extract DataType from ONNX ValueInfoProto
 DataType getDtype(const onnx::ValueInfoProto& value_info);
@@ -52,7 +52,7 @@ Layout getLayout(tmd* tensor);
 std::vector<Dim> get_initializer_shape(const onnx::TensorProto& initializer);
 
 // Format and print all tensor metadata in graph
-void print_tensor_vector_metadata(const std::vector<tmd*>& tensors, std::ostream& os = std::cout);
+void print_tensor_vector_metadata(const std::vector<tmd*>& tensors, std::ostream& os);
 
 // Process uninferred ONNX ValueInfo inputs/outputs/intermediates
 void tensor_uninfered(
