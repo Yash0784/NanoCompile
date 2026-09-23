@@ -1,34 +1,9 @@
 #include <iostream>
 #include <string>
-#include <variant>
 #include <fstream>
 #include "onnx.pb.h" 
 #include "graph.hpp"
 #include "shapeInfer.hpp"
-
-
-// Helper function to print a symbolic expression recursively
-void print_dim_expression(const Dim& dim, std::ostream& os = std::cout) {
-    if (std::holds_alternative<int64_t>(dim.expr)) {
-        os << std::get<int64_t>(dim.expr);
-    } else if (std::holds_alternative<std::string>(dim.expr)) {
-        os << std::get<std::string>(dim.expr);
-    } else {
-        const auto& bin = std::get<Dim::BinaryOp>(dim.expr);
-        os << "(";
-        // Pass 'os' recursively so nested expressions write to the same stream
-        print_dim_expression(*(bin.left), os);
-        switch (bin.op) {
-            case OpType::ADD: os << " + "; break;
-            case OpType::SUB: os << " - "; break;
-            case OpType::MUL: os << " * "; break;
-            case OpType::DIV: os << " / "; break;
-        }
-        print_dim_expression(*(bin.right), os);
-        os << ")";
-    }
-}
-
 
 
 DataType getDtype(const onnx::ValueInfoProto& value_info) {
@@ -43,8 +18,23 @@ DataType getDtype(const onnx::ValueInfoProto& value_info) {
 }
 
 
-std::vector<Dim> getShape(onnx::ValueInfoProto value_info){
-    std::vector<Dim> ret;
+// Reads a ValueInfoProto's shape and returns it as a fully concrete
+// vector<int64_t>. ONNX represents each axis as EITHER a fixed integer
+// (dim_value) OR a symbolic name (dim_param, e.g. "batch_size", "N" --
+// exporters aren't consistent about the string). Since this project fixes
+// its batch size before parsing (see ONNXGraph::build_graph), every
+// dim_param encountered here is substituted with `batch_size` directly.
+//
+// NOTE: this assumes the only symbolic axis your model exports is the
+// batch axis. That's true for a plain feed-forward/CNN inference graph
+// (the common case), but if a model genuinely has some OTHER dynamic axis
+// (e.g. a variable sequence length), substituting batch_size for it would
+// silently produce the wrong shape. The printed line below every time a
+// substitution happens exists so you can eyeball the dim_param names in
+// your own model and confirm this assumption actually holds before trusting
+// the output.
+std::vector<int64_t> getShape(onnx::ValueInfoProto value_info, int64_t batch_size){
+    std::vector<int64_t> ret;
     std::cout << "Name: " << value_info.name() << " Shape: [";
     if(value_info.has_type() && value_info.type().has_tensor_type() && value_info.type().tensor_type().has_shape()){
         const auto& shape = value_info.type().tensor_type().shape();
@@ -52,16 +42,24 @@ std::vector<Dim> getShape(onnx::ValueInfoProto value_info){
             const auto& dim = shape.dim(i);
 
             if(dim.has_dim_value()){
-                ret.push_back(Dim{dim.dim_value()});
+                ret.push_back(dim.dim_value());
                 std::cout << dim.dim_value();
             }
             else if(dim.has_dim_param()){
-                ret.push_back(Dim{dim.dim_param()});
-                std::cout << dim.dim_param();
+                // Symbolic axis -- substitute the fixed batch size.
+                ret.push_back(batch_size);
+                std::cout << batch_size << " (resolved from symbolic '" << dim.dim_param() << "')";
             }
             else{
-                ret.push_back(Dim{"?"});
-                std::cout << '?';
+                // Neither a fixed value nor a named symbol -- ONNX allows
+                // a totally empty dim entry for "unknown", which we can't
+                // resolve to anything meaningful. Flag it rather than
+                // guessing.
+                std::cerr << "\n[-] Warning: tensor '" << value_info.name()
+                          << "' has an unresolvable dimension at axis " << i
+                          << " (no dim_value, no dim_param). Defaulting to 1.\n";
+                ret.push_back(1);
+                std::cout << '1';
             }
 
             if(i < shape.dim_size() - 1) std::cout << ",";
@@ -83,14 +81,17 @@ Layout getLayout(tmd* tensor){
     else return Layout::UNSPECIFIED;
 }
 
-std::vector<Dim> get_initializer_shape(const onnx::TensorProto& initializer) {
-    std::vector<Dim> shape;
+// Initializer dims in ONNX are always concrete integers -- a weight tensor
+// can never have a symbolic axis -- so this needs no batch_size argument
+// and no substitution logic.
+std::vector<int64_t> get_initializer_shape(const onnx::TensorProto& initializer) {
+    std::vector<int64_t> shape;
     
     // initializer.dims_size() tells you the rank (number of dimensions)
     for (int i = 0; i < initializer.dims_size(); ++i) {
         // initializer.dims(i) reads the actual integer size of that axis
         int64_t static_dim = initializer.dims(i);
-        shape.push_back(Dim(static_dim));
+        shape.push_back(static_dim);
     }
     
     return shape;
@@ -114,10 +115,11 @@ void print_tensor_vector_metadata(const std::vector<tmd*>& tensors, std::ostream
         // 2. Print Data Type
         os << "  -> Type:      " << data_type_to_string(tensor->dtype) << "\n";
         
-        // 3. Format and print the shape tracking vector
+        // 3. Format and print the shape vector (plain integers now, no
+        //    symbolic expression tree to walk).
         os << "  -> Shape:     [";
         for (size_t j = 0; j < tensor->shape.size(); ++j) {
-            print_dim_expression(tensor->shape[j], os);
+            os << tensor->shape[j];
             if (j < tensor->shape.size() - 1) {
                 os << ", ";
             }
@@ -125,7 +127,13 @@ void print_tensor_vector_metadata(const std::vector<tmd*>& tensors, std::ostream
         os << "]\n";
         os << "  -> Layout:    " << layout_to_string(tensor->layout) << "\n";
 
-        // 4. Print Producer Node
+        // 4. Byte size -- this is the new information the swap planner
+        //    actually needs: how much GPU memory this one tensor costs.
+        os << "  -> Elements:  " << tensor->num_elements << "\n";
+        os << "  -> Bytes:     " << tensor->bytes
+           << " (" << (tensor->bytes / 1024.0 / 1024.0) << " MB)\n";
+
+        // 5. Print Producer Node
         os << "  -> Producer:  ";
         if (tensor->producer != nullptr) {
             // Display node name if set, otherwise fallback to its op_type
@@ -138,7 +146,7 @@ void print_tensor_vector_metadata(const std::vector<tmd*>& tensors, std::ostream
             os << (tensor->is_initializer ? "None [WEIGHT_INITIALIZER]" : "None [GRAPH_INPUT]") << "\n";
         }
 
-        // 5. Print Consumer Nodes
+        // 6. Print Consumer Nodes
         os << "  -> Consumers: ";
         if (tensor->consumers.empty()) {
             os << "None [GRAPH_OUTPUT]\n";
@@ -166,12 +174,17 @@ void print_tensor_vector_metadata(const std::vector<tmd*>& tensors, std::ostream
     }
 }
 
-void tensor_uninfered(tmd *tensor, onnx::ValueInfoProto tens, bool isInput, std::unordered_map<std::string, tmd*>& master_tensor_map, std::vector<tmd*>& tensors){
+void tensor_uninfered(tmd *tensor, onnx::ValueInfoProto tens, bool isInput, std::unordered_map<std::string, tmd*>& master_tensor_map, std::vector<tmd*>& tensors, int64_t batch_size){
     tensor->name = tens.name();
     tensor->dtype = getDtype(tens);
     std::cout << data_type_to_string(tensor->dtype) << " ";
-    tensor->shape = getShape(tens);
+    tensor->shape = getShape(tens, batch_size);
     if(isInput) tensor->layout = getLayout(tensor);
+
+    // Shape is fully concrete the moment getShape returns, so bytes can be
+    // computed right here instead of in a separate pass over the graph.
+    compute_tensor_bytes(tensor);
+
     tensors.push_back(tensor);
     master_tensor_map[tens.name()] = tensor;
 }
@@ -210,7 +223,13 @@ void link_tensor_producers_and_consumers(const std::vector<onnx::NodeProto>& top
     }
 }
 
-void ONNXGraph::build_graph(const onnx::ModelProto& model){
+void ONNXGraph::build_graph(const onnx::ModelProto& model, int64_t batch_size){
+    // Lock in the batch size this whole graph (and every byte-size number
+    // derived from it) is valid for. See the header comment on
+    // ONNXGraph::batch_size for what re-planning for a different batch
+    // size requires.
+    this->batch_size = batch_size;
+
     // Extract Global Metadata
     this->ir_version = model.ir_version();
     this->model_version = model.model_version();
@@ -232,6 +251,10 @@ void ONNXGraph::build_graph(const onnx::ModelProto& model){
         tens->is_initializer = true;
         tens->is_constant = true;
 
+        // Initializer shapes are always concrete already (no symbolic axis
+        // is legal on a weight tensor), so bytes can be computed immediately.
+        compute_tensor_bytes(tens);
+
         isInit[tensor.name()] = true;
         tensors.push_back(tens);
         master_tensor_map[tensor.name()] = tens;
@@ -250,18 +273,18 @@ void ONNXGraph::build_graph(const onnx::ModelProto& model){
 
     for(onnx::ValueInfoProto in : inputs){
         tmd *tensor = new tmd();
-        tensor_uninfered(tensor, in, true, master_tensor_map, tensors);
+        tensor_uninfered(tensor, in, true, master_tensor_map, tensors, batch_size);
     }
 
     for(onnx::ValueInfoProto out : outputs){
         tmd *tensor = new tmd();
-        tensor_uninfered(tensor, out, false, master_tensor_map, tensors);
+        tensor_uninfered(tensor, out, false, master_tensor_map, tensors, batch_size);
     }
 
     for(onnx::ValueInfoProto inter : inters){
         if(isInit[inter.name()]) continue;
         tmd *tensor = new tmd();
-        tensor_uninfered(tensor, inter, false, master_tensor_map, tensors);
+        tensor_uninfered(tensor, inter, false, master_tensor_map, tensors, batch_size);
     }
 
     if(graph.value_info_size() == 0){
@@ -287,7 +310,9 @@ void ONNXGraph::build_graph(const onnx::ModelProto& model){
                 node_outputs.push_back(new_output);
             }
 
-            // Route the vectors to shape inference functions
+            // Route the vectors to shape inference functions. Byte-size
+            // computation for each of node_outputs happens inside
+            // infershape_driver itself, right after the shape is set.
             infershape_driver(node, node.op_type(), graph.initializer(), node_inputs, node_outputs);
         
         }

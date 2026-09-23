@@ -1,32 +1,12 @@
 // infer function for every operator should be called at an operator and give the tmd struct which can be directly used
 #include <vector>
 #include <string>
-#include <variant>
 #include <iostream>
 #include <stdexcept>
 #include <algorithm>
+#include <cmath>
 #include "onnx.pb.h"
 #include "shapeInfer.hpp"
-
-// Constructor for static dimensions (int64_t)
-Dim::Dim(int64_t val) : expr(val) {}
-
-// Constructor for dynamic string variables
-Dim::Dim(std::string var) : expr(var) {}
-
-// Constructor for binary operations (like additions or multiplications)
-Dim::Dim(OpType op, Dim* l, Dim* r) : expr(BinaryOp{op, l, r}) {}
-
-// Method to check if the dimension is a static constant number
-bool Dim::is_static() const { 
-    return std::holds_alternative<int64_t>(expr); 
-}
-
-// Method to safely retrieve the static integer value
-int64_t Dim::get_static() const { 
-    return std::get<int64_t>(expr); 
-}
-
 
 const char* data_type_to_string(DataType dtype) {
     switch (dtype) {
@@ -53,21 +33,52 @@ const char* layout_to_string(Layout layout) {
     }
 }
 
-// --- Operator Overloads to Handle Equations with Objects Natively ---
+// ============================================================================
+// Byte-size computation
+// ============================================================================
 
-// Generates a new Addition operation block or collapses constants immediately
-Dim operator+(const Dim& left, const Dim& right){
-    if (left.is_static() && right.is_static()) {
-        return Dim(left.get_static() + right.get_static());
+// Bytes-per-element lookup for every dtype the parser currently recognizes.
+// UNKNOWN has no defined size -- callers should treat a 0 here as a signal
+// that dtype was never resolved for that tensor, rather than a real size.
+size_t dtype_size_bytes(DataType dtype) {
+    switch (dtype) {
+        case DataType::FLOAT32: return 4;
+        case DataType::UINT8:   return 1;
+        case DataType::INT8:    return 1;
+        case DataType::INT32:   return 4;
+        case DataType::INT64:   return 8;
+        case DataType::FLOAT16: return 2;
+        case DataType::UNKNOWN:
+        default:
+            return 0;
     }
-    // Allocate heap structures to store variable equations safely
-    return Dim(OpType::ADD, new Dim(left), new Dim(right));
 }
 
-// Generates a new Multiplication expression tracking block (e.g., height * 2)
-Dim operator*(const Dim& left, int64_t right_val) {
-    if (left.is_static()) return Dim(left.get_static() * right_val);
-    return Dim(OpType::MUL, new Dim(left), new Dim(right_val));
+// Fills in num_elements/bytes for a tensor whose shape is already fully
+// concrete. Product-over-empty-shape correctly yields 1 (a scalar has one
+// element), matching normal tensor semantics.
+void compute_tensor_bytes(tmd* tensor) {
+    if (tensor == nullptr) return;
+
+    size_t elems = 1;
+    for (int64_t d : tensor->shape) {
+        // A negative or zero dim here means something upstream failed to
+        // resolve a real size (e.g. an unresolved reshape wildcard) --
+        // flag it loudly instead of silently producing a bogus byte count.
+        if (d <= 0) {
+            std::cerr << "[-] Warning: tensor '" << tensor->name
+                      << "' has a non-positive dimension (" << d
+                      << ") when computing byte size. "
+                      << "num_elements/bytes will be set to 0.\n";
+            tensor->num_elements = 0;
+            tensor->bytes = 0;
+            return;
+        }
+        elems *= static_cast<size_t>(d);
+    }
+
+    tensor->num_elements = elems;
+    tensor->bytes = elems * dtype_size_bytes(tensor->dtype);
 }
 
 // --- Protobuf Attribute Parsing Extraction Utilities ---
@@ -173,16 +184,14 @@ void infer_relu(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, st
 }
 
 
-// Evaluates which dimension wins the broadcasting matching test under an optimistic assumption
-Dim broadcast_dims_optimistic(const Dim& a, const Dim& b){
-    // If input A is explicitly a unit channel 1, B is the expanded shape dimension
-    if (a.is_static() && a.get_static() == 1) return b;
-    // If input B is explicitly a unit channel 1, A is the expanded shape dimension
-    if (b.is_static() && b.get_static() == 1) return a;
-    
-    // Optimistic fallback: Since the exported graph is valid, if neither is 1,
-    // they must be identical values at execution runtime. Return either option.
-    return a; 
+// Evaluates which dimension wins the broadcasting matching test.
+// With shapes now plain int64_t there is no "unresolved" case to fall back
+// on -- either one side is 1 (defer to the other) or the exported graph
+// guarantees they're equal (return either).
+int64_t broadcast_dims_optimistic(int64_t a, int64_t b){
+    if (a == 1) return b;
+    if (b == 1) return a;
+    return a;
 }
 
 void infer_add(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs){
@@ -191,14 +200,14 @@ void infer_add(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std
     
     // Broadcasting iterates from back-to-front, so the maximum rank determines the output vector size
     size_t max_rank = std::max(shape_A.size(), shape_B.size());
-    std::vector<Dim> out_shape;
+    std::vector<int64_t> out_shape;
     out_shape.reserve(max_rank);
 
     // Step from the back of the shape arrays toward the front (right-aligned broadcast logic)
     for (size_t i = 0; i < max_rank; ++i) {
         // Pad with a unit dimension of 1 if one tensor has a smaller rank than the other
-        Dim dim_A = (i < shape_A.size()) ? shape_A[shape_A.size() - 1 - i] : Dim(1);
-        Dim dim_B = (i < shape_B.size()) ? shape_B[shape_B.size() - 1 - i] : Dim(1);
+        int64_t dim_A = (i < shape_A.size()) ? shape_A[shape_A.size() - 1 - i] : 1;
+        int64_t dim_B = (i < shape_B.size()) ? shape_B[shape_B.size() - 1 - i] : 1;
         
         // Push to the front of our processing list to maintain correct shape directionality
         out_shape.insert(out_shape.begin(), broadcast_dims_optimistic(dim_A, dim_B));
@@ -232,26 +241,24 @@ void infer_matmul(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, 
     }
     
     // Matrix Multiplication rule: Input A [..., M, K] x Input B [..., K, N] -> Output [..., M, N]
-    Dim k1 = shape_A[rA - 1];
-    Dim k2 = shape_B[rB - 2];
+    int64_t k1 = shape_A[rA - 1];
+    int64_t k2 = shape_B[rB - 2];
 
-    if(std::holds_alternative<int64_t>(k1.expr) && std::holds_alternative<int64_t>(k2.expr)){
-        if(k1.get_static() != k2.get_static()){
-            std::cerr << "[-] Error: Incompatable tensor sizes, infer_gemm returned.\n";
-            return;
-        }
+    if(k1 != k2){
+        std::cerr << "[-] Error: Incompatable tensor sizes, infer_matmul returned.\n";
+        return;
     }
 
-    Dim M = (rA > 1) ? shape_A[rA - 2] : Dim(1);
-    Dim N = shape_B[rB - 1];
+    int64_t M = (rA > 1) ? shape_A[rA - 2] : 1;
+    int64_t N = shape_B[rB - 1];
 
     // Compute dynamic layout alignments for outer batch channels (e.g., 3D/4D tensors)
     size_t batch_rank = std::max(rA > 2 ? rA - 2 : 0, rB > 2 ? rB - 2 : 0);
-    std::vector<Dim> out_shape;
+    std::vector<int64_t> out_shape;
     
     for (size_t i = 0; i < batch_rank; ++i) {
-        Dim dim_A = (i < rA - 2) ? shape_A[rA - 3 - i] : Dim(1);
-        Dim dim_B = (i < rB - 2) ? shape_B[rB - 3 - i] : Dim(1);
+        int64_t dim_A = (i < rA - 2) ? shape_A[rA - 3 - i] : 1;
+        int64_t dim_B = (i < rB - 2) ? shape_B[rB - 3 - i] : 1;
         out_shape.insert(out_shape.begin(), broadcast_dims_optimistic(dim_A, dim_B));
     }
     
@@ -293,30 +300,26 @@ void infer_gemm(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, st
     int64_t transB = get_node_attr_int(node, "transB", 0);
 
     // Determine output dimensions safely based on transposition
-    // This is likely where your operator[] crashed if shape_A or shape_B were smaller than expected!
+    int64_t k1 = (transA == 0) ? shape_A[1] : shape_A[0];
+    int64_t k2 = (transB == 0) ? shape_B[0] : shape_B[1];
 
-    Dim k1 = (transA == 0) ? shape_A[1] : shape_A[0];
-    Dim k2 = (transB == 0) ? shape_B[0] : shape_B[1];
-
-    if(std::holds_alternative<int64_t>(k1.expr) && std::holds_alternative<int64_t>(k2.expr)){
-        if(k1.get_static() != k2.get_static()){
-            std::cerr << "[-] Error: Incompatable tensor sizes, infer_gemm returned.\n";
-            return;
-        }
+    if(k1 != k2){
+        std::cerr << "[-] Error: Incompatable tensor sizes, infer_gemm returned.\n";
+        return;
     }
 
-    Dim M = (transA == 0) ? shape_A[0] : shape_A[1];
-    Dim N = (transB == 0) ? shape_B[1] : shape_B[0];
+    int64_t M = (transA == 0) ? shape_A[0] : shape_A[1];
+    int64_t N = (transB == 0) ? shape_B[1] : shape_B[0];
 
     // 3. Handle optional 3rd input C (Bias)
     if (inputs.size() > 2 && inputs[2] != nullptr){
         const auto& shape_C = inputs[2]->shape;
         bool flag = true;
         if(shape_C.size() == 1){
-            if(shape_C[0].get_static() != N.get_static()) flag = false;
+            if(shape_C[0] != N) flag = false;
         }
         else if(shape_C.size() == 2){
-            if(!((shape_C[0].get_static() == M.get_static() || shape_C[0].get_static() == 1) && (shape_C[1].get_static() == N.get_static() || (shape_C[1].get_static() == 1)))) flag = false;
+            if(!((shape_C[0] == M || shape_C[0] == 1) && (shape_C[1] == N || shape_C[1] == 1))) flag = false;
         }
         else{
             flag = false;
@@ -360,31 +363,30 @@ void infer_conv(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, st
     if (pads.empty()) pads.assign(num_spatial_axes * 2, 0);
 
     outputs[0]->shape.clear();
-    outputs[0]->shape.push_back(input_shape[0]);  // Batch Size -> 1
+    outputs[0]->shape.push_back(input_shape[0]);  // Batch Size -> already concrete (fixed at parse time)
     outputs[0]->shape.push_back(weight_shape[0]); // Out Channels -> 8
 
+    // With batch fixed up front, every spatial input dim is already a
+    // concrete int64_t, so the output size can always be computed directly
+    // -- no is_static() branch/fallback needed anymore.
     for (size_t i = 0; i < num_spatial_axes; ++i) {
-        if (input_shape[2 + i].is_static() && weight_shape[2 + i].is_static()) {
-            int64_t in_size = input_shape[2 + i].get_static();
-            int64_t stride  = strides[i];
+        int64_t in_size = input_shape[2 + i];
+        int64_t stride  = strides[i];
 
-            if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
-                // FIXED: ONNX 'SAME' formula scales output directly by stride via ceiling division
-                int64_t out_size = std::ceil(static_cast<double>(in_size) / stride);
-                outputs[0]->shape.push_back(Dim(out_size));
-            } else {
-                // Fallback to explicit pads calculation if auto_pad is NOTSET or empty
-                int64_t k_size  = weight_shape[2 + i].get_static();
-                int64_t pad_begin = pads[i];
-                int64_t pad_end   = pads[i + num_spatial_axes]; 
-                int64_t dilation  = dilations[i];
-
-                int64_t effective_k = (k_size - 1) * dilation + 1;
-                int64_t out_size = std::floor(static_cast<double>(in_size + pad_begin + pad_end - effective_k) / stride) + 1;
-                outputs[0]->shape.push_back(Dim(out_size));
-            }
+        if (auto_pad == "SAME_UPPER" || auto_pad == "SAME_LOWER") {
+            // ONNX 'SAME' formula scales output directly by stride via ceiling division
+            int64_t out_size = std::ceil(static_cast<double>(in_size) / stride);
+            outputs[0]->shape.push_back(out_size);
         } else {
-            outputs[0]->shape.push_back(Dim("dynamic_spatial_out"));
+            // Fallback to explicit pads calculation if auto_pad is NOTSET or empty
+            int64_t k_size  = weight_shape[2 + i];
+            int64_t pad_begin = pads[i];
+            int64_t pad_end   = pads[i + num_spatial_axes]; 
+            int64_t dilation  = dilations[i];
+
+            int64_t effective_k = (k_size - 1) * dilation + 1;
+            int64_t out_size = std::floor(static_cast<double>(in_size + pad_begin + pad_end - effective_k) / stride) + 1;
+            outputs[0]->shape.push_back(out_size);
         }
     }
     outputs[0]->dtype = inputs[0]->dtype;
@@ -406,35 +408,38 @@ void infer_conv(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, st
 
 void infer_pooling(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs){
     // Pooling drops spatial width/height features but keeps total channel volume identical
-    Dim N = inputs[0]->shape[0];
-    Dim C = inputs[0]->shape[1]; 
+    int64_t N = inputs[0]->shape[0];
+    int64_t C = inputs[0]->shape[1]; 
 
     std::vector<int64_t> kernel_shape = get_node_attr_ints(node, "kernel_shape");
     std::vector<int64_t> strides = get_node_attr_ints(node, "strides");
     std::vector<int64_t> pads = get_node_attr_ints(node, "pads");
 
-    std::vector<Dim> out_shape = { N, C };
+    std::vector<int64_t> out_shape = { N, C };
 
-    // Calculate structural compression limits sequentially across spatial axes
+    // Calculate structural compression limits sequentially across spatial axes.
+    // All input spatial dims are concrete now, so this always computes directly.
     for (size_t i = 2; i < inputs[0]->shape.size(); ++i) {
-        auto in_dim = inputs[0]->shape[i];
-        if (in_dim.is_static() && kernel_shape.size() > i - 2) {
+        int64_t in_dim = inputs[0]->shape[i];
+        if (kernel_shape.size() > i - 2) {
             int64_t k_dim = kernel_shape[i - 2];
             int64_t stride = (strides.size() > i - 2) ? strides[i - 2] : 1;
             int64_t pad_low = (pads.size() > (i - 2)) ? pads[i - 2] : 0;
             int64_t pad_high = (pads.size() > (i - 2) + 2) ? pads[(i - 2) + 2] : 0;
 
             // Pooling explicit scaling math
-            int64_t out_dim = ((in_dim.get_static() + pad_low + pad_high - k_dim) / stride) + 1;
-            out_shape.push_back(Dim(out_dim));
+            int64_t out_dim = ((in_dim + pad_low + pad_high - k_dim) / stride) + 1;
+            out_shape.push_back(out_dim);
         } else {
-            out_shape.push_back(Dim(inputs[0]->name + "_pool_spatial"));
+            std::cerr << "[-] Error: infer_pooling missing kernel_shape entry for spatial axis "
+                      << (i - 2) << " on node '" << node.name() << "'.\n";
+            out_shape.push_back(-1); // flagged by compute_tensor_bytes as invalid
         }
     }
     outputs[0]->shape = out_shape;
     outputs[0]->dtype = inputs[0]->dtype;
 
-    //Infer shape.
+    //Infer layout.
     if (inputs.empty() || outputs.empty()) return;
     outputs[0]->layout = inputs[0]->layout;
 }
@@ -460,18 +465,13 @@ void infer_reshape(const onnx::NodeProto& node, const std::vector<tmd*>& inputs,
         }
     }
 
-    // 2. If we found the static dimensions, handle the ONNX Reshape rules (0 and -1)
+    // 2. If we found the static dimensions, handle the ONNX Reshape rules (0 and -1).
+    //    With batch fixed up front, data_tensor->shape is always fully concrete,
+    //    so total_elements is always computable -- no has_static_input flag needed.
     if (found_static_shape) {
         int64_t total_elements = 1;
-        bool has_static_input = true;
-        
-        // Compute total elements in input shape to resolve a potential "-1" wildcard
-        for (const auto& d : data_tensor->shape) {
-            if (d.is_static()) {
-                total_elements *= d.get_static();
-            } else {
-                has_static_input = false;
-            }
+        for (int64_t d : data_tensor->shape) {
+            total_elements *= d;
         }
 
         int wildcard_index = -1;
@@ -484,60 +484,62 @@ void infer_reshape(const onnx::NodeProto& node, const std::vector<tmd*>& inputs,
                 // ONNX Rule: '0' means copy the dimension from the input tensor at that index
                 if (i < data_tensor->shape.size()) {
                     outputs[0]->shape.push_back(data_tensor->shape[i]);
-                    if (data_tensor->shape[i].is_static()) {
-                        target_elements_product *= data_tensor->shape[i].get_static();
-                    }
+                    target_elements_product *= data_tensor->shape[i];
                 } else {
-                    outputs[0]->shape.push_back(Dim("unknown"));
+                    std::cerr << "[-] Error: Reshape '0' rule references an axis beyond the "
+                              << "input tensor's rank on node '" << node.name() << "'.\n";
+                    outputs[0]->shape.push_back(-1);
                 }
             } 
             else if (dim == -1) {
                 // ONNX Rule: '-1' means infer this dimension based on the remaining elements
                 wildcard_index = static_cast<int>(i);
-                outputs[0]->shape.push_back(Dim(-1)); // Placeholder
+                outputs[0]->shape.push_back(-1); // Placeholder, resolved below
             } 
             else {
-                outputs[0]->shape.push_back(Dim(dim));
+                outputs[0]->shape.push_back(dim);
                 target_elements_product *= dim;
             }
         }
 
-        // Resolve the wildcard (-1) dimension if both inputs and targets are static
-        if (wildcard_index != -1 && has_static_input && target_elements_product > 0) {
+        // Resolve the wildcard (-1) dimension.
+        if (wildcard_index != -1 && target_elements_product > 0) {
             int64_t inferred_dim = total_elements / target_elements_product;
-            outputs[0]->shape[wildcard_index] = Dim(inferred_dim);
+            outputs[0]->shape[wildcard_index] = inferred_dim;
         }
 
+        //Infer Layout.
+        size_t out_rank = outputs[0]->shape.size();
+        if (out_rank == 1) {
+            outputs[0]->layout = Layout::FLAT;
+        } else if (out_rank == 2) {
+            outputs[0]->layout = Layout::ROW_MAJOR;
+        } else {
+            outputs[0]->layout = Layout::UNSPECIFIED;
+        }
         return;
     }
 
-    // Fallback: if it's genuinely dynamic, use the shape tensor's size as a fallback rank descriptor
-    if (shape_tensor->shape.size() > 0 && shape_tensor->shape[0].is_static()) {
-        int64_t rank = shape_tensor->shape[0].get_static();
-        for (int64_t i = 0; i < rank; ++i) {
-            outputs[0]->shape.push_back(Dim("dynamic_dim"));
-        }
-    } else {
-        outputs[0]->shape.push_back(Dim("dynamic_reshape_rank"));
-    }
+    // Reaching here means Reshape's target-shape input isn't a static
+    // initializer (it's produced by some other subgraph at runtime, e.g.
+    // Shape->Gather->Concat patterns). Since shapes are plain int64_t now
+    // (no symbolic placeholder to fall back on), this can't be represented
+    // -- flag it clearly instead of silently emitting a bogus shape. If you
+    // hit this on a real model, the fix is to extend this branch to walk
+    // that subgraph and compute the target dims yourself.
+    std::cerr << "[-] Error: Reshape on node '" << node.name()
+              << "' has a non-static target shape input ('" << shape_tensor->name
+              << "'). This is not supported without symbolic shapes -- "
+              << "output shape left empty.\n";
 
-    //Infer Layout.
     if (outputs.empty()) return;
-    
-    size_t out_rank = outputs[0]->shape.size();
-    if (out_rank == 1) {
-        outputs[0]->layout = Layout::FLAT;
-    } else if (out_rank == 2) {
-        outputs[0]->layout = Layout::ROW_MAJOR;
-    } else {
-        outputs[0]->layout = Layout::UNSPECIFIED; // Destroys semantic NCHW context
-    }
+    outputs[0]->layout = Layout::UNSPECIFIED;
 }
 
 void infer_transpose(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, std::vector<tmd*>& outputs) {
     std::vector<int64_t> perm = get_node_attr_ints(node, "perm");
     size_t rank = inputs[0]->shape.size();
-    std::vector<Dim> out_shape(rank, Dim(0)); // Allocate slot positions
+    std::vector<int64_t> out_shape(rank, 0); // Allocate slot positions
 
     if (perm.empty()) {
         // ONNX Specification: If 'perm' attribute is empty, completely reverse the axis layout stack
@@ -575,15 +577,16 @@ void infer_concat(const onnx::NodeProto& node, const std::vector<tmd*>& inputs, 
     if (axis < 0) axis += rank;
 
     // Use the first input to baseline standard architectural dimensions
-    std::vector<Dim> out_shape = inputs[0]->shape; 
-    Dim concat_axis_expr = inputs[0]->shape[axis];
+    std::vector<int64_t> out_shape = inputs[0]->shape; 
+    int64_t concat_axis_size = inputs[0]->shape[axis];
 
-    // Iteratively append sizes to accumulate the target connection axis symbolically
+    // Iteratively sum up sizes along the target concat axis -- plain integer
+    // addition now, no overloaded Dim '+' operator needed.
     for (size_t i = 1; i < inputs.size(); ++i) {
-        concat_axis_expr = concat_axis_expr + inputs[i]->shape[axis]; // Invokes our overloaded '+' operator
+        concat_axis_size += inputs[i]->shape[axis];
     }
 
-    out_shape[axis] = concat_axis_expr;
+    out_shape[axis] = concat_axis_size;
     outputs[0]->shape = out_shape;
     outputs[0]->dtype = inputs[0]->dtype;
 
@@ -644,5 +647,13 @@ void infershape_driver(const onnx::NodeProto& node, std::string op, const google
                 << "' encountered on node '" << node.name() << "'." << "\n";
         // You can choose to throw an exception here depending on your runtime architecture requirements:
         // throw std::runtime_error("Unsupported operator: " + op);
+    }
+
+    // Every op above (when it succeeds) leaves node_outputs[*]->shape fully
+    // concrete, so byte sizes can be computed right here, uniformly, for
+    // every operator type in one place instead of repeating this call
+    // inside each infer_* function.
+    for (tmd* out_tensor : node_outputs) {
+        compute_tensor_bytes(out_tensor);
     }
 }
