@@ -1,5 +1,6 @@
 #include "graph.hpp"
 #include "op_profiler.hpp" // profile_node() + the cuda/cublas/cudnn types it needs
+#include "swap_plan.hpp"
 
 int main(int argc, char* argv[]){
     if(argc < 2){
@@ -43,6 +44,11 @@ int main(int argc, char* argv[]){
     CUBLAS_CHECK(cublasSetStream(g_cublas, compute));
     CUDNN_CHECK(cudnnSetStream(g_cudnn, compute));
 
+    // One-time PCIe bandwidth calibration, on the exact swap_in/swap_out
+    // streams the real execution will later use, then derive every
+    // tensor's swap_in_time/swap_out_time from its real ->bytes.
+    PCIeBandwidthModel pcie_model = profile_pcie_bandwidth(swap_in, swap_out);
+    compute_tensor_swap_times(graph.tensors, pcie_model);
 
     for (size_t i = 0; i < graph.nodes.size(); ++i) {
         const auto& node = graph.nodes[i];
@@ -91,7 +97,11 @@ int main(int argc, char* argv[]){
     else {
         std::cerr << "Error: Could not open output file for writing.\n";
     }
-
+    int prefetch = 1;
+    if(argc >= 4){
+        prefetch = std::stoll(argv[3]);
+    }
+    std::cout << "Excess_time: " << estimate_linear(graph, prefetch) << "\n";
     google::protobuf::ShutdownProtobufLibrary();
     return 0;
 }

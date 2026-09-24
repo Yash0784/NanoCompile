@@ -75,7 +75,8 @@ typedef struct TensorMetadata{
     bool shape_inferred = false;
     bool optimized = false;
 
-    float exec_ms = -1;
+    float swap_in_time = -1;
+    float swap_out_time = -1;
 }tmd;
 
 

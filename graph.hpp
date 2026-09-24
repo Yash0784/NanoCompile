@@ -34,7 +34,7 @@ public:
     std::unordered_map<std::string, tmd*> master_tensor_map;
     std::vector<tmd*> tensors;
     std::vector<onnx::NodeProto> nodes;
-    std::vector<float> nodeTime;
+    std::vector<float> nodeTime; //time in ms.
     std::unordered_map<int, int> layer;
 
     void build_graph(const onnx::ModelProto& model, int64_t batch_size = 1);

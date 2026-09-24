@@ -3,6 +3,8 @@
 #include <vector>
 #include <numeric>   // std::accumulate
 #include <algorithm>
+#include <utility>   // std::pair, std::tie
+#include <cstring>   // std::memset
 
 #include "shapeInfer.hpp"
 #include "op_profiler.hpp" // declares profile_node -- included here so the
@@ -486,5 +488,151 @@ double profile_node(const onnx::NodeProto& node, const std::string& op,
         std::cerr << "[-] Error: no profiler implemented for op '" << op
                   << "' on node '" << node.name() << "'. Recording 0.\n";
         return 0.0;
+    }
+}
+
+// ============================================================================
+// 5. PCIe BANDWIDTH CALIBRATION + PER-TENSOR SWAP TIMES
+// ============================================================================
+// Real PCIe copy time isn't just bytes/bandwidth -- every cudaMemcpyAsync
+// call has a roughly-fixed per-call overhead (driver call, DMA setup) that
+// dominates at small sizes and is negligible at large ones. So instead of
+// trusting one flat GB/s number, we sweep real transfers across a range of
+// sizes and least-squares fit an affine model per direction:
+//
+//     time_ms(bytes) = latency_ms + slope_ms_per_byte * bytes
+//
+// then apply that model to every tensor's actual ->bytes to fill in
+// ->swap_in_time / ->swap_out_time. Same warmup+average discipline as
+// profile_node above, just timing memcpys instead of cuDNN/cuBLAS calls.
+
+double PCIeBandwidthModel::h2d_bandwidth_GBps() const {
+    if (h2d_slope_ms_per_byte <= 0.0) return 0.0;
+    double bytes_per_ms = 1.0 / h2d_slope_ms_per_byte;
+    return bytes_per_ms * 1000.0 / 1e9; // bytes/ms -> bytes/s -> GB/s
+}
+double PCIeBandwidthModel::d2h_bandwidth_GBps() const {
+    if (d2h_slope_ms_per_byte <= 0.0) return 0.0;
+    double bytes_per_ms = 1.0 / d2h_slope_ms_per_byte;
+    return bytes_per_ms * 1000.0 / 1e9;
+}
+
+namespace {
+
+// Least-squares fit of ms = a + b*bytes over the collected (bytes, ms)
+// samples. Returns {intercept_ms, slope_ms_per_byte}.
+std::pair<double, double> fit_affine(const std::vector<double>& xs_bytes,
+                                      const std::vector<double>& ys_ms) {
+    size_t n = xs_bytes.size();
+    double sum_x = 0, sum_y = 0, sum_xy = 0, sum_xx = 0;
+    for (size_t i = 0; i < n; ++i) {
+        sum_x  += xs_bytes[i];
+        sum_y  += ys_ms[i];
+        sum_xy += xs_bytes[i] * ys_ms[i];
+        sum_xx += xs_bytes[i] * xs_bytes[i];
+    }
+    double denom = (double)n * sum_xx - sum_x * sum_x;
+    double b = (denom != 0.0) ? ((double)n * sum_xy - sum_x * sum_y) / denom : 0.0;
+    double a = (sum_y - b * sum_x) / (double)n;
+    // Both latency and slope should physically be >= 0. Noise at the
+    // smallest sizes can pull the fit line slightly negative at the
+    // intercept -- clamp so small tensors never get a nonsensical
+    // negative swap time.
+    if (a < 0.0) a = 0.0;
+    if (b < 0.0) b = 0.0;
+    return {a, b};
+}
+
+// Geometric sweep from 4KB up to max_bytes (4x growth per step -- keeps
+// the sweep short while still covering the fixed-overhead regime at the
+// small end and the bandwidth-bound regime at the large end).
+std::vector<size_t> make_sweep_sizes(size_t max_bytes) {
+    std::vector<size_t> sizes;
+    size_t s = 4ull * 1024; // 4 KB floor
+    while (s < max_bytes) {
+        sizes.push_back(s);
+        s *= 4;
+    }
+    sizes.push_back(max_bytes); // always include the actual allocation ceiling
+    return sizes;
+}
+
+} // namespace
+
+PCIeBandwidthModel profile_pcie_bandwidth(cudaStream_t h2d_stream,
+                                           cudaStream_t d2h_stream){
+    // Measure real free memory rather than trusting a nominal number --
+    // same principle as budgeting the 6GB against actual runtime
+    // free-memory (CUDA context / cuDNN workspace already eat some of it).
+    size_t free_bytes = 0, total_bytes = 0;
+    CUDA_CHECK(cudaMemGetInfo(&free_bytes, &total_bytes));
+
+    // Need a pinned host buffer AND a device buffer of this size at the
+    // same time, plus headroom for whatever runs after calibration --
+    // stay well under what's actually free.
+    size_t max_bytes = free_bytes / 4;
+    const size_t hard_cap = 512ull * 1024 * 1024; // bandwidth-bound regime is already visible well before this
+    if (max_bytes > hard_cap) max_bytes = hard_cap;
+    if (max_bytes < 1ull * 1024 * 1024) {
+        std::cerr << "[!] Warning: only " << (free_bytes / 1024.0 / 1024.0)
+                  << " MB free for PCIe calibration -- results may be unreliable.\n";
+        if (max_bytes < 64ull * 1024) max_bytes = 64ull * 1024; // absolute floor so the sweep can still run
+    }
+
+    std::vector<size_t> sizes = make_sweep_sizes(max_bytes);
+
+    // One pinned host buffer + one device buffer, both sized to the sweep
+    // ceiling; each step just transfers a prefix of them. Pinned matters:
+    // pageable host memory would force the driver through an internal
+    // bounce buffer, measuring a slower number that doesn't match what
+    // the real swap-in/out copies (also pinned) will actually see.
+    void* h_ptr = nullptr;
+    void* d_ptr = nullptr;
+    CUDA_CHECK(cudaHostAlloc(&h_ptr, max_bytes, cudaHostAllocDefault));
+    CUDA_CHECK(cudaMalloc(&d_ptr, max_bytes));
+    std::memset(h_ptr, 0, max_bytes);
+    CUDA_CHECK(cudaMemset(d_ptr, 0, max_bytes));
+
+    std::vector<double> h2d_bytes, h2d_ms, d2h_bytes, d2h_ms;
+    const int warmup = 3, iters = 10;
+
+    for (size_t sz : sizes) {
+        double ms_h2d = profile(h2d_stream, warmup, iters, [&](){
+            CUDA_CHECK(cudaMemcpyAsync(d_ptr, h_ptr, sz, cudaMemcpyHostToDevice, h2d_stream));
+        });
+        h2d_bytes.push_back((double)sz);
+        h2d_ms.push_back(ms_h2d);
+
+        double ms_d2h = profile(d2h_stream, warmup, iters, [&](){
+            CUDA_CHECK(cudaMemcpyAsync(h_ptr, d_ptr, sz, cudaMemcpyDeviceToHost, d2h_stream));
+        });
+        d2h_bytes.push_back((double)sz);
+        d2h_ms.push_back(ms_d2h);
+    }
+
+    CUDA_CHECK(cudaFreeHost(h_ptr));
+    CUDA_CHECK(cudaFree(d_ptr));
+
+    PCIeBandwidthModel model;
+    std::tie(model.h2d_latency_ms, model.h2d_slope_ms_per_byte) = fit_affine(h2d_bytes, h2d_ms);
+    std::tie(model.d2h_latency_ms, model.d2h_slope_ms_per_byte) = fit_affine(d2h_bytes, d2h_ms);
+
+    std::cout << "[PCIe calibration] swept " << sizes.size() << " sizes up to "
+              << (max_bytes / 1024.0 / 1024.0) << " MB\n"
+              << "  H2D: latency=" << model.h2d_latency_ms << " ms, bandwidth="
+              << model.h2d_bandwidth_GBps() << " GB/s\n"
+              << "  D2H: latency=" << model.d2h_latency_ms << " ms, bandwidth="
+              << model.d2h_bandwidth_GBps() << " GB/s\n";
+
+    return model;
+}
+
+void compute_tensor_swap_times(const std::vector<tmd*>& tensors,
+                                const PCIeBandwidthModel& model){
+    for (tmd* t : tensors) {
+        if (!t || t->bytes == 0) continue;
+        double bytes = (double)t->bytes;
+        t->swap_in_time  = (float)(model.h2d_latency_ms + model.h2d_slope_ms_per_byte * bytes);
+        t->swap_out_time = (float)(model.d2h_latency_ms + model.d2h_slope_ms_per_byte * bytes);
     }
 }

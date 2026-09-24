@@ -133,6 +133,11 @@ void print_tensor_vector_metadata(const std::vector<tmd*>& tensors, std::ostream
         os << "  -> Bytes:     " << tensor->bytes
            << " (" << (tensor->bytes / 1024.0 / 1024.0) << " MB)\n";
 
+        // 4b. Swap costs -- filled by compute_tensor_swap_times() after
+        //     the one-time PCIe calibration; -1 means not yet computed.
+        os << "  -> SwapIn:    " << tensor->swap_in_time  << " ms\n";
+        os << "  -> SwapOut:   " << tensor->swap_out_time << " ms\n";
+
         // 5. Print Producer Node
         os << "  -> Producer:  ";
         if (tensor->producer != nullptr) {
